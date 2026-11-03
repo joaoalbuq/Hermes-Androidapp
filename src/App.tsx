@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import { GatewayClient, type ConnectionState } from './lib/protocol/client'
+import { GatewayClient, RpcCallError, type ConnectionState } from './lib/protocol/client'
 import { PasswordAuthSession, CookieAuthSession, DEFAULT_PROVIDER } from './lib/protocol/auth'
-import type { Credential } from './lib/protocol/types'
+import { METHOD_NOT_FOUND, type Credential } from './lib/protocol/types'
 import {
   HANDLED_SERVER_REQUESTS,
   type OpenRequestEntry,
@@ -20,6 +20,19 @@ import LoginScreen from './components/LoginScreen'
 
 type Phase = 'loading' | 'setup' | 'main'
 type DrawerTab = 'sessions' | 'bots'
+
+/**
+ * "There is no session with this id here" — 4007 from session.resume, 4001 from
+ * the older canonical handlers. Either way the id is dead and retrying it on
+ * another verb is pointless.
+ */
+const STALE_SESSION_CODES = [4001, 4007]
+
+const isStaleSession = (err: unknown) =>
+  err instanceof RpcCallError && STALE_SESSION_CODES.includes(err.code)
+
+const isUnknownMethod = (err: unknown) =>
+  err instanceof RpcCallError && err.code === METHOD_NOT_FOUND
 
 export default function App() {
   const [conns, setConns] = useState<storage.SavedConnection[]>([])
@@ -40,6 +53,21 @@ export default function App() {
   const clientRef = useRef<GatewayClient | null>(null)
   const activeConnectionRef = useRef<storage.SavedConnection | null>(null)
   const activeSessionRef = useRef<string | null>(null)
+  /** Durable id of the open chat, so a resume does not re-attach what is already open. */
+  const durableIdRef = useRef<string | null>(null)
+  /** Last attach failure, so a resume chain can report once after trying several ids. */
+  const attachErrorRef = useRef<string | null>(null)
+  /** Durable id -> runtime handle of the current attach, for events and RPCs. */
+  const runtimeByKey = useRef(new Map<string, string>())
+
+  /** Fold a runtime handle back onto the durable id the store is keyed by. */
+  const durableKeyFor = useCallback((id: string | null): string | null => {
+    if (!id) return null
+    for (const [key, runtime] of runtimeByKey.current) {
+      if (runtime === id) return key
+    }
+    return id
+  }, [])
   const profileRef = useRef<string | null>(null)
   const resolvers = useRef(new Map<string, (result: Record<string, unknown>) => void>())
 
@@ -102,29 +130,88 @@ export default function App() {
     }
   }, [])
 
-  const attachSession = useCallback(async (sessionId: string) => {
+  /**
+   * Attach to one session and return whether it worked.
+   *
+   * `sessionId` must be a DURABLE id: the stored id from a list row or a profile
+   * roster. Two verbs matter here:
+   *   - session.resume  — durable path, reuses a live run or rebuilds a cold one;
+   *                       absent on the older in-process sidecar.
+   *   - session.activate — only attaches to a session that is already live here.
+   * The reply's `session_id` is a RUNTIME handle, minted per attach: it is what
+   * prompt.submit and the event stream use, and it is dead the moment this socket
+   * closes, so it must never be the id we remember for next launch.
+   */
+  const attachSession = useCallback(async (sessionId: string, options?: { quiet?: boolean }): Promise<boolean> => {
     const client = clientRef.current
-    if (!client) return
-    try {
-      const result = await client.request<SessionAttachResult>('session.activate', {
-        session_id: sessionId,
-        // The bot this chat belongs to: without it the gateway resolves the
-        // session against the default profile home.
-        profile: profileRef.current,
-        cols: null,
-      })
-      const id = result?.session_id || sessionId
-      dispatch({ type: 'attach', sessionId: id, result, profile: profileRef.current })
-      // Remember it so the next launch (on this device) and the next bot switch
-      // land back in the same conversation.
-      const connection = activeConnectionRef.current
-      if (connection) void storage.saveLastSession(connection.id, profileRef.current, id)
-      if (result?.inflight?.streaming) {
-        setBanner('Attached to a turn already running on the gateway.')
-      }
-    } catch (err) {
-      setBanner(`Could not attach: ${(err as Error).message}`)
+    if (!client) return false
+    const profile = profileRef.current
+    attachErrorRef.current = null
+    const params = {
+      session_id: sessionId,
+      // The bot this chat belongs to: without it the gateway resolves the
+      // session against the default profile home.
+      profile,
+      cols: null,
     }
+
+    let result: SessionAttachResult | null = null
+    let failure: unknown = null
+    for (const method of ['session.resume', 'session.activate'] as const) {
+      try {
+        result = await client.request<SessionAttachResult>(method, {
+          ...params,
+          ...(method === 'session.resume' ? { defer_history: false, lazy: false } : {}),
+        })
+        break
+      } catch (err) {
+        failure = err
+        // A dead id fails the same way on the other verb, and a refused profile
+        // (4064) will not fix itself: only a missing verb is worth a second try.
+        if (isStaleSession(err)) break
+      }
+    }
+
+    if (!result) {
+      const connection = activeConnectionRef.current
+      if (isStaleSession(failure)) {
+        // Forget the dead id, otherwise every launch repeats this failure.
+        if (connection) void storage.saveLastSession(connection.id, profile, null)
+        attachErrorRef.current = profile
+          ? `bot "${profile}" has no chat with id ${sessionId} any more`
+          : `that chat (${sessionId}) no longer exists on the gateway`
+      } else {
+        attachErrorRef.current = `${(failure as Error)?.message || 'unknown error'}`
+      }
+      // A resume chain tries several candidates; only the last one may speak.
+      if (!options?.quiet) {
+        setBanner(
+          isStaleSession(failure)
+            ? `Could not open ${attachErrorRef.current}. Pick a chat from the list instead.`
+            : `Could not attach: ${attachErrorRef.current}`,
+        )
+      }
+      return false
+    }
+
+    // Keep the durable id as the chat's identity and hang the runtime handle off
+    // it: the drawer, the discovery rows and next launch's resume all speak
+    // durable ids, while events and prompt.submit speak the runtime one.
+    const durableId = result.stored_session_id || sessionId
+    const runtimeId = result.session_id || sessionId
+    runtimeByKey.current.set(durableId, runtimeId)
+    durableIdRef.current = durableId
+    dispatch({ type: 'attach', sessionId: durableId, result, profile, runtimeId })
+    dispatch({ type: 'active', sessionId: durableId })
+    const connection = activeConnectionRef.current
+    if (connection) {
+      // Persist the durable id, never the runtime handle.
+      void storage.saveLastSession(connection.id, profile, durableId)
+    }
+    if (result.inflight?.streaming) {
+      setBanner('Attached to a turn already running on the gateway.')
+    }
+    return true
   }, [])
 
   /**
@@ -145,15 +232,32 @@ export default function App() {
       const bot = profile
         ? roster.find((row) => row.name === profile)
         : roster.find((row) => row.is_default) || roster[0]
-      const fromGateway = bot?.last_session?.session_id || null
-      const newest = stored[0]?.id || null
+      // The roster's own chats. `last_session` is the newest ordinary chat and
+      // `canonical_session` is the bot's forever chat — both carry the durable
+      // id under `id`. Try them in turn: a saved id can be stale (chat deleted,
+      // or the bot renamed), and one dead id must not block the whole resume.
+      const candidates = [
+        saved,
+        bot?.last_session?.id,
+        bot?.canonical_session?.id,
+        stored[0]?.id,
+      ].filter((id): id is string => !!id)
 
-      const target = saved || fromGateway || newest
-      if (!target) return
-      if (target === activeSessionRef.current) return
-
-      dispatch({ type: 'active', sessionId: target })
-      await attachSession(target)
+      for (const target of candidates) {
+        if (target === activeSessionRef.current || target === durableIdRef.current) return
+        dispatch({ type: 'active', sessionId: target })
+        if (await attachSession(target, { quiet: true })) return
+      }
+      if (candidates.length > 0) {
+        setBanner(
+          `Could not open a chat${profile ? ` for ${profile}` : ''}: ${attachErrorRef.current || 'no session found'}`,
+        )
+      } else if (profile) {
+        // A bot with an empty roster row is not an error, but leaving the previous
+        // bot's chat on screen under a new profile name would be misleading.
+        setBanner(`${profile} has no chats yet — start one with ＋.`)
+        dispatch({ type: 'active', sessionId: null })
+      }
     },
     [attachSession],
   )
@@ -236,7 +340,10 @@ export default function App() {
               else await resumeLastChat(roster, stored)
             })()
           },
-          onEvent: (type, sessionId, payload) => {
+          onEvent: (type, eventSessionId, payload) => {
+            // Events arrive addressed to the runtime handle; the store is keyed by
+            // the durable id so list rows and the open chat are one session.
+            const sessionId = durableKeyFor(eventSessionId)
             if (type === 'sessions.changed') {
               void refreshDiscovery()
               return
@@ -259,7 +366,9 @@ export default function App() {
           },
           onServerRequest: (method, params, id) => {
             if (!(HANDLED_SERVER_REQUESTS as readonly string[]).includes(method)) return null
-            const sessionId = (params.session_id as string | undefined) || activeSessionRef.current
+            const sessionId =
+              durableKeyFor((params.session_id as string | undefined) || null) ||
+              activeSessionRef.current
             const request: OpenRequestEntry = { id, method, params }
             dispatch({ type: 'prompt', sessionId, request })
             return new Promise<Record<string, unknown>>((resolve) => {
@@ -274,7 +383,7 @@ export default function App() {
       clientRef.current = client
       client.connect()
     },
-    [attachSession, refreshDiscovery, refreshProfiles, resumeLastChat],
+    [attachSession, durableKeyFor, refreshDiscovery, refreshProfiles, resumeLastChat],
   )
 
   // ------------------------------------------------------------------ boot ---
@@ -325,8 +434,15 @@ export default function App() {
       })
       const id = result?.session_id
       if (!id) throw new Error('gateway returned no session id')
-      dispatch({ type: 'attach', sessionId: id, result, profile: profileRef.current })
-      dispatch({ type: 'active', sessionId: id })
+      const durableId = result?.stored_session_id || id
+      runtimeByKey.current.set(durableId, id)
+      durableIdRef.current = durableId
+      dispatch({ type: 'attach', sessionId: durableId, result, profile: profileRef.current, runtimeId: id })
+      dispatch({ type: 'active', sessionId: durableId })
+      const connection = activeConnectionRef.current
+      if (connection) {
+        void storage.saveLastSession(connection.id, profileRef.current, durableId)
+      }
       void refreshDiscovery()
     } catch (err) {
       setBanner(`Could not create a chat: ${(err as Error).message}`)
@@ -336,8 +452,11 @@ export default function App() {
   const sendPrompt = useCallback(
     async (text: string, steer: boolean) => {
       const client = clientRef.current
-      const sessionId = activeSessionRef.current
-      if (!client || !sessionId) return
+      const key = activeSessionRef.current
+      if (!client || !key) return
+      // Address the runtime handle: the durable id is not what prompt.submit takes
+      // once a gateway has re-attached the chat under a fresh handle.
+      const sessionId = runtimeByKey.current.get(key) || key
       if (steer) {
         // Mid-turn correction: appended to the live run, delivered at the next
         // tool boundary. Never interrupts the turn.
@@ -348,7 +467,7 @@ export default function App() {
           setBanner(`Steer rejected, sending as a prompt instead: ${(err as Error).message}`)
         }
       }
-      dispatch({ type: 'localUser', sessionId, text })
+      dispatch({ type: 'localUser', sessionId: key, text })
       try {
         await client.request('prompt.submit', { session_id: sessionId, text })
       } catch (err) {
@@ -360,8 +479,9 @@ export default function App() {
 
   const interrupt = useCallback(async () => {
     const client = clientRef.current
-    const sessionId = activeSessionRef.current
-    if (!client || !sessionId) return
+    const key = activeSessionRef.current
+    if (!client || !key) return
+    const sessionId = runtimeByKey.current.get(key) || key
     try {
       await client.request('session.interrupt', { session_id: sessionId })
     } catch (err) {

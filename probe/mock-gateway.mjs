@@ -102,10 +102,19 @@ function decodeFrame(buffer) {
 
 const nowSeconds = () => Date.now() / 1000
 
+/**
+ * Stored chats, one home per profile — as the real gateway keeps them.
+ *
+ * A session id is only resolvable inside its own profile's store, which is why a
+ * client that activates profile-B's id against the default home gets
+ * 4007 "session not found".
+ */
 const STORED_SESSIONS = [
   {
     id: 'sess-001',
+    profile: 'default',
     resolved_id: 'sess-001',
+    model: 'claude-sonnet-4',
     title: 'Refactor the ingest pipeline',
     preview: 'I moved the parser into its own module and…',
     started_at: nowSeconds() - 86400,
@@ -114,14 +123,49 @@ const STORED_SESSIONS = [
   },
   {
     id: 'sess-002',
+    profile: 'ops',
     resolved_id: 'sess-002',
+    model: 'gpt-5-codex',
     title: 'Tailscale + reverse proxy setup',
     preview: 'Set dashboard.public_url to the public origin…',
     started_at: nowSeconds() - 3600,
     message_count: 8,
     source: 'cli',
   },
+  {
+    id: 'live-1',
+    profile: 'default',
+    resolved_id: 'live-1',
+    model: 'claude-sonnet-4',
+    title: 'Nightly migration',
+    preview: 'running the migration now',
+    started_at: nowSeconds() - 300,
+    message_count: 12,
+    source: 'desktop',
+  },
 ]
+
+const profileOf = (profile) => profile || 'default'
+const storedFor = (idOrTitle, profile) =>
+  STORED_SESSIONS.find(
+    (s) => profileOf(s.profile) === profileOf(profile) && (s.id === idOrTitle || s.title === idOrTitle),
+  ) || null
+
+/** A two-turn transcript for a chat this fixture has no real history for. */
+function transcriptFor(stored) {
+  return [
+    {
+      role: 'user',
+      text: `Pick up where we left off: ${stored.title.toLowerCase()}.`,
+      timestamp: stored.started_at + 2,
+    },
+    {
+      role: 'assistant',
+      text: stored.preview || 'On it.',
+      timestamp: stored.started_at + 4,
+    },
+  ]
+}
 
 function liveRow() {
   return {
@@ -240,6 +284,51 @@ function createSocketBridge(socket) {
   socket.on('error', close)
 
   let approved = false
+  let runtimeSeq = 0
+  /** runtime handle -> stored chat, the two-id model session.resume introduces. */
+  const runtimeToStored = new Map()
+
+  function snapshot(stored, runtimeId) {
+    const live = stored.id === 'live-1'
+    return {
+      session_id: runtimeId,
+      stored_session_id: stored.id,
+      resumed: live ? stored.id : null,
+      session_key: stored.id,
+      message_count: live ? TRANSCRIPT.length : 2,
+      messages: live ? TRANSCRIPT : transcriptFor(stored),
+      info: {
+        model: stored.model,
+        provider: 'anthropic',
+        cwd: '/srv/app',
+        title: stored.title,
+        running: live,
+        turn_started_at: live ? nowSeconds() - 12 : null,
+        stored_session_id: stored.id,
+      },
+      running: live,
+      status: live ? 'working' : 'idle',
+      ...(live
+        ? {
+            turn_started_at: nowSeconds() - 12,
+            inflight: INFLIGHT,
+            open_requests: [
+              {
+                id: 'srq-open-1',
+                method: 'approval',
+                params: {
+                  session_id: runtimeId,
+                  request_id: 'req-open-1',
+                  command: 'pnpm migrate --apply',
+                  description: 'Apply migration 0042 to staging',
+                  choices: ['once', 'session', 'always', 'deny'],
+                },
+              },
+            ],
+          }
+        : {}),
+    }
+  }
 
   function handle(request) {
     // A response to one of OUR server->client requests.
@@ -269,10 +358,17 @@ function createSocketBridge(socket) {
         respond(id, { ok: true })
         return
       case 'session.list':
-        respond(id, { sessions: STORED_SESSIONS })
+        // Profile-scoped, like the real handler: the default home does not see
+        // another bot's chats.
+        respond(id, {
+          sessions: STORED_SESSIONS.filter((s) => profileOf(s.profile) === profileOf(params?.profile)),
+        })
         return
       case 'session.active_list':
-        respond(id, { sessions: [liveRow()] })
+        // Live sessions are profile-scoped too; the default home owns live-1.
+        respond(id, {
+          sessions: profileOf(params?.profile) === 'default' ? [liveRow()] : [],
+        })
         return
       case 'profiles.list':
         // Whole roster, as the real handler returns it — each bot carries the
@@ -288,7 +384,15 @@ function createSocketBridge(socket) {
               display_name: 'Main',
               description: 'general assistant',
               skill_count: 12,
-              last_session: { title: 'Nightly migration', session_id: 'live-1' },
+              // The durable id lives under `id` — `session_id` does not exist here.
+              last_session: {
+                id: 'live-1',
+                title: 'Nightly migration',
+                preview: 'running the migration now',
+                started_at: nowSeconds() - 300,
+                last_active: nowSeconds() - 2,
+                message_count: 12,
+              },
             },
             {
               name: 'ops',
@@ -299,7 +403,14 @@ function createSocketBridge(socket) {
               display_name: 'Ops bot',
               description: 'infra and deploys',
               skill_count: 4,
-              last_session: { title: 'Tailscale + reverse proxy setup', session_id: 'sess-002' },
+              last_session: {
+                id: 'sess-002',
+                title: 'Tailscale + reverse proxy setup',
+                preview: 'Set dashboard.public_url to the public origin…',
+                started_at: nowSeconds() - 3600,
+                last_active: nowSeconds() - 1800,
+                message_count: 8,
+              },
             },
             {
               name: 'writer',
@@ -313,49 +424,48 @@ function createSocketBridge(socket) {
               last_session: null,
             },
           ],
+          bot_mode_protocol: true,
+          install_id: 'mock-install',
         })
         return
-      case 'session.activate':
-        respond(id, {
-          session_id: 'live-1',
-          resumed: 'live-1',
-          session_key: 'live-1',
-          stored_session_id: 'live-1',
-          message_count: TRANSCRIPT.length,
-          messages: TRANSCRIPT,
-          info: {
-            model: 'claude-sonnet-4',
-            provider: 'anthropic',
-            cwd: '/srv/app',
-            title: 'Nightly migration',
-            running: true,
-            turn_started_at: nowSeconds() - 12,
-            stored_session_id: 'live-1',
-          },
-          running: true,
-          status: 'working',
-          turn_started_at: nowSeconds() - 12,
-          inflight: INFLIGHT,
-          open_requests: [
-            {
-              id: 'srq-open-1',
-              method: 'approval',
-              params: {
-                session_id: 'live-1',
-                request_id: 'req-open-1',
-                command: 'pnpm migrate --apply',
-                description: 'Apply migration 0042 to staging',
-                choices: ['once', 'session', 'always', 'deny'],
-              },
-            },
-          ],
-        })
-        streamTurn()
+      case 'session.resume': {
+        const stored = storedFor(params?.session_id, params?.profile)
+        if (!stored) {
+          respondError(id, 4007, 'session not found')
+          return
+        }
+        // A runtime handle is minted per attach; it is what events address.
+        runtimeSeq += 1
+        const runtimeId = `rt-${runtimeSeq}`
+        runtimeToStored.set(runtimeId, stored)
+        respond(id, snapshot(stored, runtimeId))
+        if (stored.id === 'live-1') streamTurn(runtimeId)
         return
-      case 'prompt.submit':
+      }
+      case 'session.activate': {
+        // Only a session that is already live here can be activated.
+        const stored = storedFor(params?.session_id, params?.profile)
+        if (!stored || stored.id !== 'live-1') {
+          respondError(id, 4007, stored ? 'session is no longer live' : 'session not found')
+          return
+        }
+        runtimeSeq += 1
+        const runtimeId = `rt-${runtimeSeq}`
+        runtimeToStored.set(runtimeId, stored)
+        respond(id, snapshot(stored, runtimeId))
+        streamTurn(runtimeId)
+        return
+      }
+      case 'prompt.submit': {
+        const stored = runtimeToStored.get(params?.session_id)
+        if (!stored) {
+          respondError(id, 4007, 'session not found')
+          return
+        }
         respond(id, { ok: true })
-        streamTurn()
+        streamTurn(params.session_id)
         return
+      }
       case 'session.interrupt':
         respond(id, { ok: true })
         return
@@ -366,28 +476,28 @@ function createSocketBridge(socket) {
 
   let streaming = false
 
-  function streamTurn() {
+  function streamTurn(sessionId) {
     if (streaming) return
     streaming = true
     const chunks = ['Applying ', 'migration ', '0042_auth_tokens', '… ', '420 rows ', 'written.']
     let index = 0
-    sendEvent('message.start', 'live-1', {})
+    sendEvent('message.start', sessionId, {})
     const tick = () => {
-      sendEvent('message.delta', 'live-1', { text: chunks[index] })
+      sendEvent('message.delta', sessionId, { text: chunks[index] })
       index += 1
       if (index < chunks.length) {
         later(tick, 120)
         return
       }
       later(() => {
-        sendEvent('tool.start', 'live-1', {
+        sendEvent('tool.start', sessionId, {
           tool_id: 'tool-9',
           name: 'bash',
           args: { command: 'pnpm migrate --apply' },
           preview: 'pnpm migrate --apply',
         })
         later(() => {
-          sendEvent('tool.complete', 'live-1', {
+          sendEvent('tool.complete', sessionId, {
             tool_id: 'tool-9',
             name: 'bash',
             duration_s: 1.8,
@@ -400,7 +510,7 @@ function createSocketBridge(socket) {
             id: 'srq-live-2',
             method: 'approval',
             params: {
-              session_id: 'live-1',
+              session_id: sessionId,
               request_id: 'req-live-2',
               command: 'git commit -am "migration 0042"',
               description: 'Commit the migration?',
@@ -408,7 +518,7 @@ function createSocketBridge(socket) {
             },
           })
           later(() => {
-            sendEvent('message.complete', 'live-1', {
+            sendEvent('message.complete', sessionId, {
               text: chunks.join(''),
               status: 'completed',
               usage: { input_tokens: 1200, output_tokens: 340 },

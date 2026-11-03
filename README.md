@@ -14,7 +14,7 @@ nothing server-side. The only setup is a gateway URL and a token.
 
 A built debug APK is attached to the GitHub release:
 
-<https://github.com/joaoalbuq/Hermes-Androidapp/releases/download/v1.0/hermes-mobile-1.0-debug.apk>
+<https://github.com/joaoalbuq/Hermes-Androidapp/releases/download/v1.1/hermes-mobile-1.1-debug.apk>
 
 Repo: <https://github.com/joaoalbuq/Hermes-Androidapp>
 
@@ -185,6 +185,23 @@ The brief said the source wins. These are the differences found by reading
    credential, or an access token a *native* sign-in minted; a password-provider gateway offers no
    such sign-in, so the ticket is the only path. Hence the username/password mode above, and hence
    the client's hint when it sees a 1006.
+
+### Two ids per chat, and which verb to attach with
+
+A chat has a **durable/stored id** and, once attached, a **runtime id** minted for that attach
+(`SessionAttachResult.session_id`, with the durable one echoed as `stored_session_id`). Events and
+`prompt.submit` address the runtime handle; lists, the roster and anything remembered across
+launches must use the durable id, because a runtime handle dies with the socket.
+
+Attaching a stored chat is `session.resume` — it reuses a live run or rebuilds a cold chat and
+returns `inflight` plus the still-open `open_requests`, which is what makes answering an approval
+issued on another device work. `session.activate` only attaches to a chat that is already live
+here, and newer gateways do not serve it at all, so the client tries `resume` and falls back.
+
+`profiles.list` returns each bot's chats as `last_session` / `canonical_session` / `worker_session`
+objects whose id is `id` (not `session_id`). Reading the wrong key silently sent the roster down a
+fallback path and produced `session not found`; the roster in `probe/mock-gateway.mjs` now mirrors
+the real shapes (per-profile homes, 4007 for an id from another profile) so that stays tested.
 
 ---
 

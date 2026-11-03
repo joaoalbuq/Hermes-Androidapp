@@ -155,6 +155,25 @@ export interface SessionAttachResult {
   hydrating?: boolean | null
 }
 
+/**
+ * A chat carried inside a profiles.list row.
+ *
+ * The key is `id` (the durable/stored id — the one session.resume accepts), not
+ * `session_id`. Reading `session_id` here yields undefined, which silently sent
+ * the roster's "open last chat" down the wrong branch.
+ */
+export interface ProfileSessionRef {
+  id: string
+  title?: string
+  preview?: string
+  started_at?: number
+  last_active?: number
+  message_count?: number
+  /** canonical_session only: the resolved lineage behind the forever chat. */
+  resolved_id?: string
+  root_title?: string
+}
+
 export interface ProfileRow {
   name: string
   path: string
@@ -164,7 +183,10 @@ export interface ProfileRow {
   description?: string
   display_name?: string
   skill_count?: number
-  last_session?: { title?: string; session_id?: string } | null
+  last_session?: ProfileSessionRef | null
+  /** The profile's forever chat, titled "Bot Chat". */
+  canonical_session?: ProfileSessionRef | null
+  worker_session?: ProfileSessionRef | null
 }
 
 export interface ClarifyQuestion {

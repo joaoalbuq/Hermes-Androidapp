@@ -180,7 +180,11 @@ export default function Drawer({
                   </div>
                   <div className="session-row-bottom">
                     <span className="session-preview">
-                      {row.last_session?.title ? `↩ ${row.last_session.title}` : 'no chats yet'}
+                      {row.last_session?.title
+                        ? `↩ ${row.last_session.title}`
+                        : row.canonical_session?.title
+                          ? `↩ ${row.canonical_session.title}`
+                          : 'no chats yet'}
                     </span>
                     <span className="session-meta">{row.model || ''}</span>
                   </div>

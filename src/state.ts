@@ -24,7 +24,15 @@ export type ChatItem =
   | { kind: 'system'; id: string; text: string; tone: 'info' | 'error' }
 
 export interface SessionState {
+  /** Durable/stored id — the stable identity a list row also carries. */
   id: string
+  /**
+   * Runtime handle minted by the attach, when the gateway gave one.
+   *
+   * Events and prompt.submit address this, and it changes on every attach, so it
+   * lives beside the durable id instead of replacing it.
+   */
+  runtimeId?: string | null
   title: string
   preview: string
   running: boolean
@@ -181,7 +189,13 @@ function inflightItems(inflight: InflightTurn): { items: ChatItem[]; streamText:
 export type Action =
   | { type: 'discovery'; stored: SessionListRow[]; live: SessionActiveItem[] }
   | { type: 'listLoading'; value: boolean }
-  | { type: 'attach'; sessionId: string; result: SessionAttachResult; profile?: string | null }
+  | {
+      type: 'attach'
+      sessionId: string
+      result: SessionAttachResult
+      profile?: string | null
+      runtimeId?: string | null
+    }
   | { type: 'detach'; sessionId: string }
   | { type: 'active'; sessionId: string | null }
   | { type: 'localUser'; sessionId: string; text: string }
@@ -249,6 +263,7 @@ export function reducer(store: Store, action: Action): Store {
       }
       const info = result.info || null
       return withSession(store, sessionId, {
+        runtimeId: action.runtimeId ?? result.session_id ?? store.sessions[sessionId]?.runtimeId ?? null,
         title: info?.title || store.sessions[sessionId]?.title || '',
         model: info?.model || store.sessions[sessionId]?.model || '',
         profile: action.profile ?? store.sessions[sessionId]?.profile ?? null,

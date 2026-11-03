@@ -18,6 +18,7 @@ interface Props {
   onRefresh: () => void
   onWake: () => void
   onRequestExemption: () => void
+  onEnableNotifications: () => void
 }
 
 const AUTH_LABEL: Record<string, string> = {
@@ -82,6 +83,7 @@ export default function ComputerPanel({
   onRefresh,
   onWake,
   onRequestExemption,
+  onEnableNotifications,
 }: Props) {
   const reachable = connState === 'open'
   const hostStatus = status?.error ? status.error : status?.data?.status || (status ? 'ok' : '—')
@@ -168,6 +170,24 @@ export default function ComputerPanel({
         ) : null}
         {keepAlive.supported && keepAlive.exempt ? (
           <p className="muted small">Exempt from battery optimisation.</p>
+        ) : null}
+      </div>
+
+      <div className="panel-card">
+        <div className="panel-card-head">
+          <strong>Notifications</strong>
+          <span className={`badge ${keepAlive.notifications ? 'badge-ok' : ''}`}>
+            {keepAlive.supported ? (keepAlive.notifications ? 'on' : 'off') : 'n/a'}
+          </span>
+        </div>
+        <p className="muted">
+          While the app is in the background, a notification says when a turn finishes and when the
+          agent is waiting on an answer.
+        </p>
+        {keepAlive.supported && !keepAlive.notifications ? (
+          <button className="secondary wide" onClick={onEnableNotifications}>
+            Allow notifications
+          </button>
         ) : null}
       </div>
     </div>

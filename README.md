@@ -14,7 +14,7 @@ nothing server-side. The only setup is a gateway URL and a token.
 
 A built debug APK is attached to the GitHub release:
 
-<https://github.com/joaoalbuq/Hermes-Androidapp/releases/download/v1.3/hermes-mobile-1.3-debug.apk>
+<https://github.com/joaoalbuq/Hermes-Androidapp/releases/download/v1.4/hermes-mobile-1.4-debug.apk>
 
 Repo: <https://github.com/joaoalbuq/Hermes-Androidapp>
 
@@ -140,6 +140,14 @@ means a proxy, firewall, or the gateway's auth/Origin guard is refusing `/api/ws
 - **One chat per bot** — the drawer collapses to the chat you are in, each bot's synced chat, and
   anything live; older chats are one tap away. Discovery is the authority: chats from another bot
   and ghost entries left by dead runtime handles are dropped instead of piling up as duplicates.
+- **Model & reasoning picker** — a pill above the composer opens the gateway's `model.options`
+  inventory with per-model capability hints. A pick runs `/model` on the open chat through
+  `command.dispatch` (the documented mid-session switch — there is no `session.set_model`), or
+  persists the choice on the bot with `config.set`; reasoning levels use `/reasoning` with the same
+  two scopes, and an expensive model is confirmed before it is written.
+- **Background notifications** — while the app is not on screen, a turn finishing or the agent
+  asking a question raises a notification (its own high-importance channel, Android 13+ permission
+  requested on connect) instead of waiting silently.
 - **Computer panel** — a third drawer tab shows the machine running the gateway from its own
   `/api/status` (version, uptime, which bots are running, reachability), plus *Wake & re-sync*, which
   redials and re-reads the host, and the background-connection state with the one Android setting

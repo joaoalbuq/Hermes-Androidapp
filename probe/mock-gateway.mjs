@@ -170,7 +170,70 @@ const MOCK_FILES = new Map([
   ],
 ])
 
+/** agent/reasoning_effort.py::EFFORT_LADDER — the vocabulary /reasoning accepts. */
+const EFFORT_LADDER = ['none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max', 'ultra']
+
+/** Model/reasoning pins: per stored chat (live) and per profile (bot default). */
+const SESSION_SETTINGS = new Map()
+const PROFILE_SETTINGS = new Map()
+
+/** What `model.options` hands the picker: providers with per-model capabilities. */
+const MODEL_PROVIDERS = [
+  {
+    slug: 'anthropic',
+    name: 'Anthropic',
+    models: ['claude-sonnet-4.6', 'claude-opus-4.1', 'claude-haiku-4'],
+    total_models: 3,
+    source: 'builtin',
+    authenticated: true,
+    capabilities: {
+      'claude-sonnet-4.6': { reasoning: true, can_disable_reasoning: true },
+      'claude-opus-4.1': { reasoning: true, can_disable_reasoning: true },
+      'claude-haiku-4': { reasoning: false },
+    },
+  },
+  {
+    slug: 'openai',
+    name: 'OpenAI',
+    models: ['gpt-6-sol', 'gpt-6-luna'],
+    total_models: 2,
+    source: 'builtin',
+    authenticated: true,
+    capabilities: {
+      'gpt-6-sol': { reasoning: true, can_disable_reasoning: true },
+      'gpt-6-luna': { reasoning: true, can_disable_reasoning: false },
+    },
+  },
+  {
+    slug: 'nous',
+    name: 'Nous Portal',
+    models: ['hermes-4-405b'],
+    total_models: 1,
+    source: 'custom',
+    authenticated: false,
+    unavailable_models: ['hermes-4-405b'],
+    capabilities: { 'hermes-4-405b': { reasoning: false } },
+  },
+]
+
+/** Picks the gateway makes you confirm before it writes them. */
+const EXPENSIVE_MODELS = new Set(['claude-opus-4.1', 'gpt-6-sol'])
+
 const profileOf = (profile) => profile || 'default'
+
+const settingsFor = (stored) => {
+  let settings = SESSION_SETTINGS.get(stored.id)
+  if (!settings) {
+    const profileDefaults = PROFILE_SETTINGS.get(profileOf(stored.profile)) || {}
+    settings = {
+      model: profileDefaults.model || stored.model || 'claude-sonnet-4.6',
+      reasoning: profileDefaults.reasoning || 'medium',
+    }
+    SESSION_SETTINGS.set(stored.id, settings)
+  }
+  return settings
+}
+
 const storedFor = (idOrTitle, profile) =>
   STORED_SESSIONS.find(
     (s) => profileOf(s.profile) === profileOf(profile) && (s.id === idOrTitle || s.title === idOrTitle),
@@ -313,6 +376,21 @@ function createSocketBridge(socket) {
   /** runtime handle -> stored chat, the two-id model session.resume introduces. */
   const runtimeToStored = new Map()
 
+  /** The `session.info` payload, also embedded in every snapshot. */
+  function infoFor(stored) {
+    const settings = settingsFor(stored)
+    return {
+      model: settings.model,
+      provider: 'anthropic',
+      cwd: '/srv/app',
+      title: stored.title,
+      running: stored.id === 'live-1',
+      reasoning_effort: settings.reasoning,
+      reasoning_effort_wire: settings.reasoning,
+      stored_session_id: stored.id,
+    }
+  }
+
   function snapshot(stored, runtimeId) {
     const live = stored.id === 'live-1'
     return {
@@ -323,13 +401,8 @@ function createSocketBridge(socket) {
       message_count: live ? TRANSCRIPT.length : 2,
       messages: live ? TRANSCRIPT : transcriptFor(stored),
       info: {
-        model: stored.model,
-        provider: 'anthropic',
-        cwd: '/srv/app',
-        title: stored.title,
-        running: live,
+        ...infoFor(stored),
         turn_started_at: live ? nowSeconds() - 12 : null,
-        stored_session_id: stored.id,
       },
       running: live,
       status: live ? 'working' : 'idle',
@@ -453,6 +526,107 @@ function createSocketBridge(socket) {
           install_id: 'mock-install',
         })
         return
+      case 'model.options': {
+        // The picker inventory, layered over the live session's provider.
+        const stored = params?.session_id ? runtimeToStored.get(params.session_id) : null
+        const settings = stored
+          ? settingsFor(stored)
+          : PROFILE_SETTINGS.get(profileOf(params?.profile)) || {}
+        const provider = stored ? 'anthropic' : 'anthropic'
+        respond(id, {
+          providers: MODEL_PROVIDERS.map((row) => ({ ...row, is_current: row.slug === provider })),
+          model: settings.model || 'claude-sonnet-4.6',
+          provider,
+        })
+        return
+      }
+      case 'command.dispatch': {
+        // Slash commands are how the gateway changes model and reasoning: there
+        // is no session.set_model. Params are {name, arg, session_id, profile}.
+        if (!params || typeof params.name !== 'string') {
+          respondError(id, 4000, 'name is required')
+          return
+        }
+        const name = params.name.replace(/^\//, '')
+        const arg = typeof params.arg === 'string' ? params.arg.trim() : ''
+        const stored = params.session_id ? runtimeToStored.get(params.session_id) : null
+        if (!stored) {
+          respondError(id, 4007, 'session not found')
+          return
+        }
+        const settings = settingsFor(stored)
+        if (name === 'model') {
+          if (!arg) {
+            respondError(id, 4004, 'model name required')
+            return
+          }
+          settings.model = arg
+          console.log(`[mock] model -> ${arg} for ${stored.id}`)
+          respond(id, { type: 'exec', output: `Model set to ${arg}.` })
+          sendEvent('session.info', params.session_id, infoFor(stored))
+          return
+        }
+        if (name === 'reasoning') {
+          if (!EFFORT_LADDER.includes(arg)) {
+            respondError(id, 4004, `unknown reasoning level: ${arg || '(none)'}`)
+            return
+          }
+          settings.reasoning = arg
+          console.log(`[mock] reasoning -> ${arg} for ${stored.id}`)
+          respond(id, { type: 'exec', output: `Reasoning effort set to ${arg}.` })
+          sendEvent('session.info', params.session_id, infoFor(stored))
+          return
+        }
+        respondError(id, -32601, `mock gateway does not implement /${name}`)
+        return
+      }
+      case 'config.set': {
+        const key = String(params?.key || '')
+        if (key === 'model') {
+          const model = String(params?.value || '')
+          if (EXPENSIVE_MODELS.has(model) && !params?.confirm_expensive_model) {
+            respond(id, {
+              key,
+              confirm_required: true,
+              confirm_message: `${model} is an expensive model — confirm to use it.`,
+            })
+            return
+          }
+          const stored = params?.session_id ? runtimeToStored.get(params.session_id) : null
+          if (stored) {
+            settingsFor(stored).model = model
+            respond(id, { key, value: model })
+            sendEvent('session.info', params.session_id, infoFor(stored))
+            return
+          }
+          const profile = profileOf(params?.profile)
+          PROFILE_SETTINGS.set(profile, { ...(PROFILE_SETTINGS.get(profile) || {}), model })
+          console.log(`[mock] profile ${profile} model -> ${model}`)
+          respond(id, { key, value: model })
+          return
+        }
+        if (key === 'reasoning') {
+          const level = String(params?.value || '')
+          if (!EFFORT_LADDER.includes(level)) {
+            respondError(id, 4004, `unknown reasoning level: ${level || '(none)'}`)
+            return
+          }
+          const stored = params?.session_id ? runtimeToStored.get(params.session_id) : null
+          if (stored) {
+            settingsFor(stored).reasoning = level
+            respond(id, { key, value: level })
+            sendEvent('session.info', params.session_id, infoFor(stored))
+            return
+          }
+          const profile = profileOf(params?.profile)
+          PROFILE_SETTINGS.set(profile, { ...(PROFILE_SETTINGS.get(profile) || {}), reasoning: level })
+          console.log(`[mock] profile ${profile} reasoning -> ${level}`)
+          respond(id, { key, value: level })
+          return
+        }
+        respondError(id, -32601, `mock gateway cannot set ${key}`)
+        return
+      }
       case 'session.resume': {
         const stored = storedFor(params?.session_id, params?.profile)
         if (!stored) {

@@ -36,6 +36,7 @@ interface Props {
   onRefreshStatus: () => void
   onWake: () => void
   onRequestExemption: () => void
+  onEnableNotifications: () => void
 }
 
 function relTime(ms: number): string {
@@ -76,6 +77,7 @@ export default function Drawer({
   onRefreshStatus,
   onWake,
   onRequestExemption,
+  onEnableNotifications,
 }: Props) {
   const [query, setQuery] = useState('')
   /**
@@ -233,6 +235,7 @@ export default function Drawer({
             onRefresh={onRefreshStatus}
             onWake={onWake}
             onRequestExemption={onRequestExemption}
+            onEnableNotifications={onEnableNotifications}
           />
         ) : (
           <>

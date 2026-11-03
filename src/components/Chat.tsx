@@ -2,6 +2,7 @@ import { useEffect, useLayoutEffect, useRef, useState } from 'react'
 import type { SessionState } from '../state'
 import { splitMedia, type StagedAttachment } from '../lib/protocol/files'
 import Prompts from './Prompts'
+import { shortModel } from './ModelSheet'
 
 interface Props {
   session: SessionState
@@ -13,6 +14,10 @@ interface Props {
   onAnswer: (id: string, result: Record<string, unknown>) => void
   onAttach: (files: File[]) => Promise<StagedAttachment[]>
   onDownload: (path: string) => Promise<void> | void
+  /** Live model + reasoning for the header pill. */
+  model?: string
+  reasoning?: string
+  onOpenModel: () => void
 }
 
 /** Distance from the bottom (px) that still counts as "at the bottom". */
@@ -64,6 +69,9 @@ export default function Chat({
   onAnswer,
   onAttach,
   onDownload,
+  model,
+  reasoning,
+  onOpenModel,
 }: Props) {
   const scrollRef = useRef<HTMLDivElement>(null)
   const fileInputRef = useRef<HTMLInputElement>(null)
@@ -206,6 +214,12 @@ export default function Chat({
 
       <div className="composer-wrap">
         <Prompts prompts={session.prompts} onAnswer={onAnswer} />
+        <button className="model-pill" onClick={onOpenModel} title="Model and reasoning">
+          <span className="model-pill-icon">◈</span>
+          <span className="model-pill-model">{shortModel(model || '')}</span>
+          <span className="model-pill-sep">·</span>
+          <span className="model-pill-level">{reasoning || 'default'}</span>
+        </button>
         {attachments.length > 0 || staging ? (
           <div className="attach-row">
             {attachments.map((attachment) => (

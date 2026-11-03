@@ -131,7 +131,59 @@ export interface SessionLiveInfo {
   turn_started_at?: number | null
   stored_session_id?: string
   approval_mode?: string
+  /** The effort the user asked for, e.g. "high" (agent/reasoning_effort.py ladder). */
+  reasoning_effort?: string
+  /** The level this provider route actually sends after its clamp. */
+  reasoning_effort_wire?: string
   [key: string]: unknown
+}
+
+/**
+ * One provider row from `model.options` — the gateway's picker inventory.
+ *
+ * `models` are the ids the picker may submit; `capabilities` is keyed by model id
+ * and says whether that model reasons at all (`reasoning`) and whether reasoning
+ * can be switched off (`can_disable_reasoning`).
+ */
+export interface ModelOptionProvider {
+  slug: string
+  name?: string
+  models?: string[]
+  total_models?: number
+  is_current?: boolean
+  is_user_defined?: boolean
+  source?: string
+  authenticated?: boolean
+  warning?: string | null
+  unavailable_models?: string[] | null
+  capabilities?: Record<string, ModelCapabilities>
+  [key: string]: unknown
+}
+
+export interface ModelCapabilities {
+  reasoning?: boolean
+  can_disable_reasoning?: boolean | null
+  fast?: boolean
+  ultrafast?: boolean
+  [key: string]: unknown
+}
+
+export interface ModelOptionsResult {
+  providers?: ModelOptionProvider[]
+  model?: string
+  provider?: string
+}
+
+/** command.dispatch's structured directive (tui_gateway/contracts/tools_commands.py). */
+export interface CommandDispatchResult {
+  type?: 'exec' | 'alias' | 'plugin' | 'send' | 'skill' | 'prefill'
+  output?: string | null
+  target?: string | null
+  message?: string | null
+  notice?: string | null
+  display?: string | null
+  name?: string | null
+  status?: string | null
 }
 
 /** Result of session.activate / session.resume / session.create. */

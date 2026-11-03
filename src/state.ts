@@ -39,6 +39,9 @@ export interface SessionState {
   /** "working" | "waiting" | "starting" | "idle" */
   status: string
   model: string
+  /** Live reasoning effort (`reasoning_effort`) and what this route really sends. */
+  reasoning: string
+  reasoningWire: string
   profile: string | null
   attached: boolean
   items: ChatItem[]
@@ -137,6 +140,8 @@ function emptySession(id: string, patch: Partial<SessionState> = {}): SessionSta
     running: false,
     status: 'idle',
     model: '',
+    reasoning: '',
+    reasoningWire: '',
     profile: null,
     attached: false,
     items: [],
@@ -208,6 +213,13 @@ export type Action =
     }
   | { type: 'promptResolved'; id: string }
   | { type: 'markUnread'; sessionId: string }
+  | {
+      type: 'turnSettings'
+      sessionId: string
+      model?: string
+      reasoning?: string
+      reasoningWire?: string
+    }
   | { type: 'event'; sessionId: string | null; eventType: string; payload: Record<string, unknown> }
   | { type: 'reset' }
 
@@ -287,6 +299,10 @@ export function reducer(store: Store, action: Action): Store {
         runtimeId: action.runtimeId ?? result.session_id ?? store.sessions[sessionId]?.runtimeId ?? null,
         title: info?.title || store.sessions[sessionId]?.title || '',
         model: info?.model || store.sessions[sessionId]?.model || '',
+        reasoning:
+          info?.reasoning_effort || store.sessions[sessionId]?.reasoning || '',
+        reasoningWire:
+          info?.reasoning_effort_wire || store.sessions[sessionId]?.reasoningWire || '',
         profile: action.profile ?? store.sessions[sessionId]?.profile ?? null,
         items,
         streamText,
@@ -356,6 +372,18 @@ export function reducer(store: Store, action: Action): Store {
         changed = true
       }
       return changed ? { ...store, sessions } : store
+    }
+
+    case 'turnSettings': {
+      // Applied optimistically right after the change is accepted: the gateway's
+      // own session.info event lands a moment later and corrects the wire level.
+      const session = store.sessions[action.sessionId]
+      if (!session) return store
+      return withSession(store, action.sessionId, {
+        model: action.model ?? session.model,
+        reasoning: action.reasoning ?? session.reasoning,
+        reasoningWire: action.reasoningWire ?? session.reasoningWire,
+      })
     }
 
     case 'markUnread': {
@@ -462,6 +490,9 @@ export function reducer(store: Store, action: Action): Store {
           return withSession(store, sessionId, {
             info,
             model: info.model || session.model,
+            // A model switch or `/reasoning` lands here as a session.info event.
+            reasoning: info.reasoning_effort ?? session.reasoning,
+            reasoningWire: info.reasoning_effort_wire ?? session.reasoningWire,
             title: info.title || session.title,
             running: !!info.running,
           })

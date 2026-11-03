@@ -10,11 +10,22 @@ import {
 import {
   keepAliveStatus,
   keepAliveSupported,
+  notifyInBackground,
   requestBatteryExemption,
+  requestNotificationPermission,
   startKeepAlive,
   stopKeepAlive,
   type KeepAliveState,
 } from './lib/native/keepalive'
+import {
+  applyModel,
+  applyReasoning,
+  loadModelOptions,
+  saveBotModel,
+  saveBotReasoning,
+  type ModelChoice,
+  type ModelOptions,
+} from './lib/protocol/models'
 import { METHOD_NOT_FOUND, type Credential } from './lib/protocol/types'
 import {
   HANDLED_SERVER_REQUESTS,
@@ -28,6 +39,7 @@ import {
   MAX_TRANSFER_BYTES,
   fetchGatewayFile,
   fileToBase64,
+  splitMedia,
   type StagedAttachment,
 } from './lib/protocol/files'
 import { saveBase64File } from './lib/native/downloads'
@@ -36,6 +48,7 @@ import { useReducer } from 'react'
 import * as storage from './lib/storage'
 import Drawer from './components/Drawer'
 import Chat from './components/Chat'
+import ModelSheet from './components/ModelSheet'
 import SettingsScreen from './components/SettingsScreen'
 import LoginScreen from './components/LoginScreen'
 
@@ -44,7 +57,12 @@ type DrawerTab = 'sessions' | 'bots' | 'computer'
 
 /** A frozen WebView can wake with a socket that looks open and is long dead. */
 const STALE_SOCKET_MS = 45_000
-const NO_KEEPALIVE: KeepAliveState = { supported: false, running: false, exempt: false }
+const NO_KEEPALIVE: KeepAliveState = {
+  supported: false,
+  running: false,
+  exempt: false,
+  notifications: false,
+}
 
 /**
  * "There is no session with this id here" — 4007 from session.resume, 4001 from
@@ -79,6 +97,16 @@ export default function App() {
   const [statusLoading, setStatusLoading] = useState(false)
   const [statusAt, setStatusAt] = useState<number | null>(null)
   const [keepAlive, setKeepAlive] = useState<KeepAliveState>(NO_KEEPALIVE)
+  /** Model + reasoning picker for the open chat. */
+  const [modelSheetOpen, setModelSheetOpen] = useState(false)
+  const [modelOptions, setModelOptions] = useState<ModelOptions | null>(null)
+  const [modelLoading, setModelLoading] = useState(false)
+  const [modelBusy, setModelBusy] = useState(false)
+  const [modelError, setModelError] = useState<string | null>(null)
+  const [modelNotice, setModelNotice] = useState<string | null>(null)
+  const [modelScope, setModelScope] = useState<'chat' | 'bot'>('chat')
+  /** A bot-scope pick the gateway wants confirmed (expensive model) before writing. */
+  const [modelConfirm, setModelConfirm] = useState<{ model: string; message: string } | null>(null)
 
   const clientRef = useRef<GatewayClient | null>(null)
   const activeConnectionRef = useRef<storage.SavedConnection | null>(null)
@@ -193,6 +221,12 @@ export default function App() {
       setStatusAt(Date.now())
       setStatusLoading(false)
     }
+  }, [])
+
+  /** A notification only makes sense when the app is not the thing on screen. */
+  const notifyIfHidden = useCallback((title: string, body: string) => {
+    if (typeof document === 'undefined' || document.visibilityState !== 'hidden') return
+    void notifyInBackground(title, body)
   }, [])
 
   /**
@@ -442,6 +476,7 @@ export default function App() {
               void refreshDiscovery()
               return
             }
+
             if (type === 'request.cancel' || type === 'approval.cancelled') {
               const id =
                 (payload.id as string | undefined) ||
@@ -457,19 +492,31 @@ export default function App() {
             }
             if (type === 'skin.changed' || type === 'platforms.changed' || type === 'cron.changed') return
             dispatch({ type: 'event', sessionId, eventType: type, payload })
-            // Finished while the phone was locked: badge it, so the drawer shows
-            // that a reply landed while the screen was off.
-            if (
-              type === 'message.complete' &&
-              sessionId &&
-              typeof document !== 'undefined' &&
-              document.visibilityState === 'hidden'
-            ) {
-              dispatch({ type: 'markUnread', sessionId })
+            // Finished while the app was in the background: badge the drawer and
+            // raise a notification, because nothing on screen would say so.
+            if (type === 'message.complete' && sessionId) {
+              if (typeof document !== 'undefined' && document.visibilityState === 'hidden') {
+                dispatch({ type: 'markUnread', sessionId })
+                const text = typeof payload.text === 'string' ? payload.text : ''
+                // A notification is prose: drop the MEDIA: tags, they are chips in the
+                // chat, not something to read on a lock screen.
+                const prose = splitMedia(text).text.trim()
+                notifyIfHidden(
+                  storeRef.current.sessions[sessionId]?.title || 'Hermes',
+                  prose ? prose.slice(0, 180) : 'The turn finished.',
+                )
+              }
             }
           },
           onServerRequest: (method, params, id) => {
             if (!(HANDLED_SERVER_REQUESTS as readonly string[]).includes(method)) return null
+            // The agent is blocked on an answer: say so if the user is elsewhere.
+            notifyIfHidden(
+              'Hermes needs an answer',
+              method === 'approval'
+                ? String((params.description as string) || (params.command as string) || 'Approval requested')
+                : 'The agent is waiting for your reply.',
+            )
             const sessionId =
               chatForEvent((params.session_id as string | undefined) || null) ||
               activeSessionRef.current
@@ -487,7 +534,15 @@ export default function App() {
       clientRef.current = client
       client.connect()
     },
-    [attachSession, chatForEvent, refreshDiscovery, refreshProfiles, refreshStatus, resumeLastChat],
+    [
+      attachSession,
+      chatForEvent,
+      notifyIfHidden,
+      refreshDiscovery,
+      refreshProfiles,
+      refreshStatus,
+      resumeLastChat,
+    ],
   )
 
   // ------------------------------------------------------------------ boot ---
@@ -533,7 +588,12 @@ export default function App() {
       return
     }
     if (connState === 'open') {
-      void startKeepAlive().then(setKeepAlive)
+      void (async () => {
+        await startKeepAlive()
+        // Android 13+ needs an explicit grant before alerts can be posted; asking
+        // here means the prompt appears while the app is open, not mid-turn later.
+        setKeepAlive(await requestNotificationPermission())
+      })()
       return
     }
     if (connState === 'closed' || connState === 'auth_failed') {
@@ -599,6 +659,10 @@ export default function App() {
 
   const allowBackground = useCallback(() => {
     void requestBatteryExemption().then(setKeepAlive)
+  }, [])
+
+  const allowNotifications = useCallback(() => {
+    void requestNotificationPermission().then(setKeepAlive)
   }, [])
 
   // -------------------------------------------------------------- commands ---
@@ -783,6 +847,146 @@ export default function App() {
     }
   }, [])
 
+  // ------------------------------------------------------- model & reasoning ---
+
+  /** Read the gateway's model inventory for the current bot / live session. */
+  const loadModels = useCallback(async (refresh = false) => {
+    const client = clientRef.current
+    if (!client) return
+    const key = activeSessionRef.current
+    setModelLoading(true)
+    setModelError(null)
+    try {
+      const options = await loadModelOptions(client, {
+        profile: profileRef.current,
+        // The live handle lets the gateway mark the row this chat really runs on.
+        sessionId: key ? runtimeByKey.current.get(key) || key : null,
+        refresh,
+      })
+      setModelOptions(options)
+    } catch (err) {
+      setModelOptions(null)
+      setModelError(
+        isUnknownMethod(err)
+          ? 'This gateway build has no model.options, so the model list cannot be read.'
+          : `Could not read the model list: ${(err as Error).message}`,
+      )
+    } finally {
+      setModelLoading(false)
+    }
+  }, [])
+
+  const openModelSheet = useCallback(() => {
+    setModelSheetOpen(true)
+    setModelError(null)
+    setModelNotice(null)
+    if (!modelOptions) void loadModels()
+  }, [loadModels, modelOptions])
+
+  /**
+   * Switch the model — on the open chat (`/model`) or persisted on the bot.
+   *
+   * Chat scope goes through command.dispatch, which is the documented mid-session
+   * switch; bot scope writes the profile's own config, so it takes effect on that
+   * bot's next chat instead of re-pinning the live one.
+   */
+  const chooseModel = useCallback(
+    async (choice: ModelChoice) => {
+      const client = clientRef.current
+      const key = activeSessionRef.current
+      const bot = profileRef.current
+      if (!client) return
+      setModelBusy(true)
+      setModelError(null)
+      setModelNotice(null)
+      try {
+        if (modelScope === 'bot') {
+          if (!bot) throw new Error('Pick a bot first — there is no profile to save to.')
+          const save = (confirm?: boolean) =>
+            saveBotModel(client, { profile: bot, model: choice.model, confirm })
+          const result = await save()
+          if (result.confirmRequired) {
+            // The gateway refuses an expensive pick until the client says so; the
+            // sheet grows a confirm bar instead of a blocking browser dialog.
+            setModelConfirm({ model: choice.model, message: result.message })
+            return
+          }
+          setModelNotice(result.message)
+          if (result.ok) void refreshProfiles()
+          return
+        }
+        if (!key) throw new Error('Open a chat first: /model applies to a live session.')
+        const result = await applyModel(client, {
+          sessionId: runtimeByKey.current.get(key) || key,
+          profile: bot,
+          model: choice.model,
+        })
+        dispatch({ type: 'turnSettings', sessionId: key, model: choice.model })
+        setModelNotice(result.message)
+      } catch (err) {
+        setModelError((err as Error).message)
+      } finally {
+        setModelBusy(false)
+      }
+    },
+    [modelScope, refreshProfiles],
+  )
+
+  /** Accept the expensive-model confirmation and write it to the bot. */
+  const confirmBotModel = useCallback(async () => {
+    const client = clientRef.current
+    const bot = profileRef.current
+    const pending = modelConfirm
+    if (!client || !bot || !pending) return
+    setModelBusy(true)
+    setModelError(null)
+    setModelConfirm(null)
+    try {
+      const result = await saveBotModel(client, { profile: bot, model: pending.model, confirm: true })
+      setModelNotice(result.message)
+      if (result.ok) void refreshProfiles()
+    } catch (err) {
+      setModelError((err as Error).message)
+    } finally {
+      setModelBusy(false)
+    }
+  }, [modelConfirm, refreshProfiles])
+
+  /** Change reasoning effort — `/reasoning` on the chat, config write on the bot. */
+  const chooseReasoning = useCallback(
+    async (level: string) => {
+      const client = clientRef.current
+      const key = activeSessionRef.current
+      const bot = profileRef.current
+      if (!client) return
+      setModelBusy(true)
+      setModelError(null)
+      setModelNotice(null)
+      try {
+        if (modelScope === 'bot') {
+          if (!bot) throw new Error('Pick a bot first — there is no profile to save to.')
+          const result = await saveBotReasoning(client, { profile: bot, level })
+          setModelNotice(result.message)
+          return
+        }
+        if (!key) throw new Error('Open a chat first: /reasoning applies to a live session.')
+        const result = await applyReasoning(client, {
+          sessionId: runtimeByKey.current.get(key) || key,
+          profile: bot,
+          level,
+        })
+        // The wire level is only known once the gateway reports it back.
+        dispatch({ type: 'turnSettings', sessionId: key, reasoning: level, reasoningWire: '' })
+        setModelNotice(result.message)
+      } catch (err) {
+        setModelError((err as Error).message)
+      } finally {
+        setModelBusy(false)
+      }
+    },
+    [modelScope],
+  )
+
   const answerPrompt = useCallback((id: string, result: Record<string, unknown>) => {
     const resolve = resolvers.current.get(id)
     resolvers.current.delete(id)
@@ -912,6 +1116,9 @@ export default function App() {
           onAnswer={answerPrompt}
           onAttach={stageFiles}
           onDownload={downloadFile}
+          model={activeSession.model}
+          reasoning={activeSession.reasoning}
+          onOpenModel={openModelSheet}
         />
       ) : (
         <div className="empty">
@@ -974,6 +1181,34 @@ export default function App() {
         onRefreshStatus={refreshStatus}
         onWake={wakeComputer}
         onRequestExemption={allowBackground}
+        onEnableNotifications={allowNotifications}
+      />
+
+      <ModelSheet
+        open={modelSheetOpen}
+        profile={profile}
+        model={activeSession?.model || ''}
+        provider={String((activeSession?.info?.provider as string) || '')}
+        reasoning={activeSession?.reasoning || ''}
+        reasoningWire={activeSession?.reasoningWire || ''}
+        options={modelOptions}
+        loading={modelLoading}
+        busy={modelBusy}
+        error={modelError}
+        notice={modelNotice}
+        scope={modelScope}
+        onScope={(next) => {
+          setModelScope(next)
+          setModelConfirm(null)
+          setModelNotice(null)
+        }}
+        confirm={modelConfirm}
+        onConfirm={() => void confirmBotModel()}
+        onCancelConfirm={() => setModelConfirm(null)}
+        onRefresh={() => void loadModels(true)}
+        onPickModel={(choice) => void chooseModel(choice)}
+        onPickReasoning={(level) => void chooseReasoning(level)}
+        onClose={() => setModelSheetOpen(false)}
       />
     </div>
   )

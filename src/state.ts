@@ -207,6 +207,7 @@ export type Action =
       request: { id: string; method: string; params: Record<string, unknown> }
     }
   | { type: 'promptResolved'; id: string }
+  | { type: 'markUnread'; sessionId: string }
   | { type: 'event'; sessionId: string | null; eventType: string; payload: Record<string, unknown> }
   | { type: 'reset' }
 
@@ -246,7 +247,27 @@ export function reducer(store: Store, action: Action): Store {
           lastActive: existing?.lastActive ?? (row.started_at ? row.started_at * 1000 : Date.now()),
         })
       }
-      return { ...store, sessions, order: order.filter((id) => sessions[id]) , stored: action.stored, live: action.live }
+
+      // Keep only what this discovery actually found, plus the open chat.
+      //
+      // Everything before this accumulated forever, so chats loaded from another
+      // bot — and ghost entries left behind by runtime handles that died with an
+      // old socket — stayed in the drawer as duplicates of the conversation the
+      // user was already in. Discovery is the authority on what exists now.
+      const keep = new Set<string>(action.stored.map((row) => row.id))
+      for (const row of action.live) keep.add(row.id)
+      if (store.activeId) keep.add(store.activeId)
+
+      const pruned: Record<string, SessionState> = {}
+      for (const [id, session] of Object.entries(sessions)) {
+        if (keep.has(id)) pruned[id] = session
+      }
+      const nextOrder = order.filter((id) => !!pruned[id])
+      // New rows go after the open chat so the list never reorders under a tap.
+      for (const id of pruned ? Object.keys(pruned) : []) {
+        if (!nextOrder.includes(id)) nextOrder.push(id)
+      }
+      return { ...store, sessions: pruned, order: nextOrder, stored: action.stored, live: action.live }
     }
 
     case 'attach': {
@@ -335,6 +356,14 @@ export function reducer(store: Store, action: Action): Store {
         changed = true
       }
       return changed ? { ...store, sessions } : store
+    }
+
+    case 'markUnread': {
+      // A turn that finished while the app was locked is news, even in the chat
+      // that is open behind the lock screen: the badge waits on the drawer.
+      const session = store.sessions[action.sessionId]
+      if (!session) return store
+      return withSession(store, action.sessionId, { unread: session.unread + 1 })
     }
 
     case 'event': {

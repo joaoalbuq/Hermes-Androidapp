@@ -1,11 +1,15 @@
 import { useMemo, useState } from 'react'
 import type { ProfileRow } from '../lib/protocol/types'
 import type { SessionState } from '../state'
+import type { ConnectionState } from '../lib/protocol/client'
+import type { GatewayStatusResult } from '../lib/protocol/auth'
+import type { KeepAliveState } from '../lib/native/keepalive'
+import ComputerPanel from './ComputerPanel'
 
 interface Props {
   open: boolean
-  tab: 'sessions' | 'bots'
-  onTab: (tab: 'sessions' | 'bots') => void
+  tab: 'sessions' | 'bots' | 'computer'
+  onTab: (tab: 'sessions' | 'bots' | 'computer') => void
   sessions: Record<string, SessionState>
   order: string[]
   activeId: string | null
@@ -19,6 +23,19 @@ interface Props {
   onNewChat: () => void
   onSettings: () => void
   onRefresh: () => void
+  /** The Hermes computer panel's inputs. */
+  connectionName: string
+  baseUrl: string
+  authMode?: string
+  connState: ConnectionState
+  connDetail: string
+  gatewayStatus: GatewayStatusResult | null
+  statusLoading: boolean
+  statusAt: number | null
+  keepAlive: KeepAliveState
+  onRefreshStatus: () => void
+  onWake: () => void
+  onRequestExemption: () => void
 }
 
 function relTime(ms: number): string {
@@ -47,8 +64,44 @@ export default function Drawer({
   onNewChat,
   onSettings,
   onRefresh,
+  connectionName,
+  baseUrl,
+  authMode,
+  connState,
+  connDetail,
+  gatewayStatus,
+  statusLoading,
+  statusAt,
+  keepAlive,
+  onRefreshStatus,
+  onWake,
+  onRequestExemption,
 }: Props) {
   const [query, setQuery] = useState('')
+  /**
+   * Collapsed by default: one bot means one conversation.
+   *
+   * The gateway keeps every chat a bot ever had, and after a reconnect it can
+   * look like the same conversation several times over. This is the switch the
+   * "only the relevant chat" behaviour hangs off — the chat you are in, the one
+   * each bot last used, and anything live stay; the rest is one tap away.
+   */
+  const [showAllChats, setShowAllChats] = useState(false)
+
+  const relevant = useMemo(() => {
+    const ids = new Set<string>()
+    if (activeId) ids.add(activeId)
+    for (const row of profiles) {
+      if (row.last_session?.id) ids.add(row.last_session.id)
+      if (row.canonical_session?.id) ids.add(row.canonical_session.id)
+    }
+    for (const session of Object.values(sessions)) {
+      if (session.running || session.status === 'working' || session.status === 'starting') {
+        ids.add(session.id)
+      }
+    }
+    return ids
+  }, [profiles, sessions, activeId])
 
   const rows = useMemo(() => {
     const needle = query.trim().toLowerCase()
@@ -73,6 +126,11 @@ export default function Drawer({
       })
   }, [order, sessions, query])
 
+  // Never collapse to nothing: with no roster (or a gateway without one) every
+  // discovered chat is all there is to show.
+  const visibleRows = showAllChats || relevant.size === 0 ? rows : rows.filter((row) => relevant.has(row.id))
+  const hiddenChats = rows.length - visibleRows.length
+
   return (
     <>
       {open ? <div className="scrim" onClick={onClose} /> : null}
@@ -88,6 +146,12 @@ export default function Drawer({
             </button>
             <button className={tab === 'bots' ? 'tab tab-active' : 'tab'} onClick={() => onTab('bots')}>
               Bots
+            </button>
+            <button
+              className={tab === 'computer' ? 'tab tab-active' : 'tab'}
+              onClick={() => onTab('computer')}
+            >
+              Computer
             </button>
           </div>
           <button className="icon-button" onClick={onClose} aria-label="Close">
@@ -113,11 +177,16 @@ export default function Drawer({
                 profile: {profile} ✕
               </button>
             ) : null}
+            {hiddenChats > 0 || showAllChats ? (
+              <button className="filter-chip subtle" onClick={() => setShowAllChats((value) => !value)}>
+                {showAllChats ? 'Only the synced chat' : `${hiddenChats} older chat${hiddenChats === 1 ? '' : 's'} — show all`}
+              </button>
+            ) : null}
             <div className="session-list">
               {rows.length === 0 && !loading ? (
                 <p className="muted pad">No sessions discovered yet.</p>
               ) : null}
-              {rows.map((session) => {
+              {visibleRows.map((session) => {
                 const live = session.status === 'working' || session.status === 'starting'
                 return (
                   <button
@@ -147,6 +216,24 @@ export default function Drawer({
               </button>
             </div>
           </>
+        ) : tab === 'computer' ? (
+          <ComputerPanel
+            connectionName={connectionName}
+            baseUrl={baseUrl}
+            authMode={authMode}
+            connState={connState}
+            connDetail={connDetail}
+            status={gatewayStatus}
+            loading={statusLoading}
+            statusAt={statusAt}
+            keepAlive={keepAlive}
+            profile={profile}
+            sessionCount={rows.length}
+            liveCount={liveCount}
+            onRefresh={onRefreshStatus}
+            onWake={onWake}
+            onRequestExemption={onRequestExemption}
+          />
         ) : (
           <>
             <p className="muted pad">

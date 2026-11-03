@@ -14,7 +14,7 @@ nothing server-side. The only setup is a gateway URL and a token.
 
 A built debug APK is attached to the GitHub release:
 
-<https://github.com/joaoalbuq/Hermes-Androidapp/releases/download/v1.2/hermes-mobile-1.2-debug.apk>
+<https://github.com/joaoalbuq/Hermes-Androidapp/releases/download/v1.3/hermes-mobile-1.3-debug.apk>
 
 Repo: <https://github.com/joaoalbuq/Hermes-Androidapp>
 
@@ -132,6 +132,18 @@ means a proxy, firewall, or the gateway's auth/Origin guard is refusing `/api/ws
 - **Pulling files down** — a `MEDIA:/path` tag in the agent's reply becomes a ⬇ chip; tapping it
   downloads the file through `/api/fs/download` (cookie-authenticated) and writes it into the
   phone's Downloads folder via a small native MediaStore plugin.
+- **Staying connected while locked** — a native foreground service with a partial wake lock keeps
+  the WebView's event loop (and the socket on it) running with the screen off, so a turn that
+  finishes in the background lands in the chat and shows up as unread. On every resume the client
+  re-dials instead of trusting a socket that reports `OPEN` and answers nothing, then re-attaches
+  the open chat and reloads its transcript.
+- **One chat per bot** — the drawer collapses to the chat you are in, each bot's synced chat, and
+  anything live; older chats are one tap away. Discovery is the authority: chats from another bot
+  and ghost entries left by dead runtime handles are dropped instead of piling up as duplicates.
+- **Computer panel** — a third drawer tab shows the machine running the gateway from its own
+  `/api/status` (version, uptime, which bots are running, reachability), plus *Wake & re-sync*, which
+  redials and re-reads the host, and the background-connection state with the one Android setting
+  that keeps the link alive through a long lock.
 - **Live streaming** — `message.delta` token by token, `tool.start` / `tool.complete` as live tool
   activity (never raw JSON), plus `message.complete`, `session.title`, `session.info`, `error`.
 - **Answering the agent** — `approval`, `clarify`, `sudo`, `secret`, `vault.code`,

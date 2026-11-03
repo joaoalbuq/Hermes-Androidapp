@@ -1,6 +1,20 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { GatewayClient, RpcCallError, type ConnectionState } from './lib/protocol/client'
-import { PasswordAuthSession, CookieAuthSession, DEFAULT_PROVIDER } from './lib/protocol/auth'
+import {
+  PasswordAuthSession,
+  CookieAuthSession,
+  DEFAULT_PROVIDER,
+  fetchGatewayStatus,
+  type GatewayStatusResult,
+} from './lib/protocol/auth'
+import {
+  keepAliveStatus,
+  keepAliveSupported,
+  requestBatteryExemption,
+  startKeepAlive,
+  stopKeepAlive,
+  type KeepAliveState,
+} from './lib/native/keepalive'
 import { METHOD_NOT_FOUND, type Credential } from './lib/protocol/types'
 import {
   HANDLED_SERVER_REQUESTS,
@@ -26,7 +40,11 @@ import SettingsScreen from './components/SettingsScreen'
 import LoginScreen from './components/LoginScreen'
 
 type Phase = 'loading' | 'setup' | 'main'
-type DrawerTab = 'sessions' | 'bots'
+type DrawerTab = 'sessions' | 'bots' | 'computer'
+
+/** A frozen WebView can wake with a socket that looks open and is long dead. */
+const STALE_SOCKET_MS = 45_000
+const NO_KEEPALIVE: KeepAliveState = { supported: false, running: false, exempt: false }
 
 /**
  * "There is no session with this id here" — 4007 from session.resume, 4001 from
@@ -56,6 +74,11 @@ export default function App() {
   const [banner, setBanner] = useState<string | null>(null)
   /** Set when a gated connection needs an in-app sign-in before it can dial. */
   const [loginFor, setLoginFor] = useState<storage.SavedConnection | null>(null)
+  /** What the Hermes computer says about itself over /api/status. */
+  const [gatewayStatus, setGatewayStatus] = useState<GatewayStatusResult | null>(null)
+  const [statusLoading, setStatusLoading] = useState(false)
+  const [statusAt, setStatusAt] = useState<number | null>(null)
+  const [keepAlive, setKeepAlive] = useState<KeepAliveState>(NO_KEEPALIVE)
 
   const clientRef = useRef<GatewayClient | null>(null)
   const activeConnectionRef = useRef<storage.SavedConnection | null>(null)
@@ -68,6 +91,10 @@ export default function App() {
   const runtimeByKey = useRef(new Map<string, string>())
   /** The signed-in session, for REST calls that are not JSON-RPC (downloads). */
   const httpAuthRef = useRef<{ httpHeaders: () => Promise<Record<string, string>> } | null>(null)
+  /** Loopback-style token auth: /api/status wants it as a header, not a query. */
+  const tokenRef = useRef('')
+  /** The store, readable from socket callbacks without re-subscribing them. */
+  const storeRef = useRef(store)
 
   /** Fold a runtime handle back onto the durable id the store is keyed by. */
   const durableKeyFor = useCallback((id: string | null): string | null => {
@@ -82,7 +109,8 @@ export default function App() {
 
   useEffect(() => {
     activeSessionRef.current = store.activeId
-  }, [store.activeId])
+    storeRef.current = store
+  }, [store])
   useEffect(() => {
     profileRef.current = profile
   }, [profile])
@@ -138,6 +166,54 @@ export default function App() {
       return []
     }
   }, [])
+
+  /**
+   * Read the Hermes computer's own status.
+   *
+   * The socket carries conversations, not host health: version, uptime and which
+   * bots are running only exist on `/api/status`, which wants the sign-in cookie
+   * on a gated gateway and the session token header on a loopback one.
+   */
+  const refreshStatus = useCallback(async () => {
+    const connection = activeConnectionRef.current
+    if (!connection) return
+    setStatusLoading(true)
+    try {
+      const auth = httpAuthRef.current
+      const headers = auth
+        ? await auth.httpHeaders()
+        : tokenRef.current
+          ? { 'x-hermes-session-token': tokenRef.current }
+          : {}
+      const result = await fetchGatewayStatus(connection.baseUrl, headers)
+      setGatewayStatus(result)
+    } catch (err) {
+      setGatewayStatus({ httpStatus: 0, data: {}, error: (err as Error).message })
+    } finally {
+      setStatusAt(Date.now())
+      setStatusLoading(false)
+    }
+  }, [])
+
+  /**
+   * Put the request on the chat it belongs to.
+   *
+   * Events arrive addressed to a runtime handle that is minted per attach. An id
+   * we have no mapping for is not a new conversation — only one chat is attached
+   * per socket — so it belongs to the open chat. Attributing it anywhere else is
+   * what used to litter the drawer with duplicate copies of the same chat.
+   */
+  const chatForEvent = useCallback(
+    (eventSessionId: string | null): string | null => {
+      if (!eventSessionId) return null
+      const mapped = durableKeyFor(eventSessionId)
+      if (mapped && (storeRef.current.sessions[mapped] || mapped === activeSessionRef.current)) {
+        return mapped
+      }
+      return activeSessionRef.current ?? mapped
+    },
+    [durableKeyFor],
+  )
 
   /**
    * Attach to one session and return whether it worked.
@@ -313,10 +389,13 @@ export default function App() {
       // File downloads are plain REST: they reuse the same session cookie.
       httpAuthRef.current = cookieSession || passwordSession || null
 
+      tokenRef.current = token
       clientRef.current?.close()
       clientRef.current = null
       dispatch({ type: 'reset' })
       setProfiles([])
+      setGatewayStatus(null)
+      setStatusAt(null)
       // Come back to the bot that was selected last, so a relaunch continues the
       // same conversation rather than the default one.
       const savedProfile = await storage.loadProfile(connection.id)
@@ -344,17 +423,21 @@ export default function App() {
           onReady: () => {
             setConnDetail('')
             void (async () => {
+              // Every dial is a fresh attach: the old runtime handle died with the
+              // old socket. Re-reading the chat is what makes a reconnect after a
+              // lock show what the gateway actually ran while the phone slept.
               const roster = await refreshProfiles()
               const stored = await refreshDiscovery()
               const active = activeSessionRef.current
-              if (active) await attachSession(active)
+              if (active) await attachSession(active, { quiet: true })
               else await resumeLastChat(roster, stored)
+              await refreshStatus()
             })()
           },
           onEvent: (type, eventSessionId, payload) => {
             // Events arrive addressed to the runtime handle; the store is keyed by
             // the durable id so list rows and the open chat are one session.
-            const sessionId = durableKeyFor(eventSessionId)
+            const sessionId = chatForEvent(eventSessionId)
             if (type === 'sessions.changed') {
               void refreshDiscovery()
               return
@@ -374,11 +457,21 @@ export default function App() {
             }
             if (type === 'skin.changed' || type === 'platforms.changed' || type === 'cron.changed') return
             dispatch({ type: 'event', sessionId, eventType: type, payload })
+            // Finished while the phone was locked: badge it, so the drawer shows
+            // that a reply landed while the screen was off.
+            if (
+              type === 'message.complete' &&
+              sessionId &&
+              typeof document !== 'undefined' &&
+              document.visibilityState === 'hidden'
+            ) {
+              dispatch({ type: 'markUnread', sessionId })
+            }
           },
           onServerRequest: (method, params, id) => {
             if (!(HANDLED_SERVER_REQUESTS as readonly string[]).includes(method)) return null
             const sessionId =
-              durableKeyFor((params.session_id as string | undefined) || null) ||
+              chatForEvent((params.session_id as string | undefined) || null) ||
               activeSessionRef.current
             const request: OpenRequestEntry = { id, method, params }
             dispatch({ type: 'prompt', sessionId, request })
@@ -394,7 +487,7 @@ export default function App() {
       clientRef.current = client
       client.connect()
     },
-    [attachSession, durableKeyFor, refreshDiscovery, refreshProfiles, resumeLastChat],
+    [attachSession, chatForEvent, refreshDiscovery, refreshProfiles, refreshStatus, resumeLastChat],
   )
 
   // ------------------------------------------------------------------ boot ---
@@ -419,8 +512,93 @@ export default function App() {
     })()
     return () => {
       clientRef.current?.close()
+      // Closing the app means no socket to hold: drop the notification too.
+      void stopKeepAlive()
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [])
+
+  // ------------------------------------------------------ background link ---
+
+  /**
+   * Hold the socket open while the phone is locked.
+   *
+   * Without this the WebView is frozen the moment the screen goes off: its timers
+   * stop, the heartbeat never fires, and a turn that finishes in the background is
+   * never seen. The service runs only while a gateway connection is up.
+   */
+  useEffect(() => {
+    if (!keepAliveSupported()) {
+      void keepAliveStatus().then(setKeepAlive)
+      return
+    }
+    if (connState === 'open') {
+      void startKeepAlive().then(setKeepAlive)
+      return
+    }
+    if (connState === 'closed' || connState === 'auth_failed') {
+      void stopKeepAlive().then(setKeepAlive)
+    }
+  }, [connState])
+
+  /**
+   * Coming back from a locked screen: redial rather than trust the socket.
+   *
+   * A frozen process wakes with a WebSocket that still reports OPEN and answers
+   * nothing, so `isOpen` alone would leave the app showing "connected" over a
+   * dead link. Redialling fires onReady, which re-attaches the open chat and
+   * reloads its transcript — the resync the app was missing.
+   */
+  const resync = useCallback(() => {
+    const client = clientRef.current
+    if (!client) return
+    if (!client.isOpen || client.silenceMs > STALE_SOCKET_MS) {
+      client.reconnectNow()
+      return
+    }
+    void refreshDiscovery()
+    void refreshStatus()
+  }, [refreshDiscovery, refreshStatus])
+
+  useEffect(() => {
+    const onWake = () => {
+      if (typeof document !== 'undefined' && document.visibilityState === 'hidden') return
+      resync()
+    }
+    const onOnline = () => resync()
+    document.addEventListener('visibilitychange', onWake)
+    window.addEventListener('focus', onWake)
+    window.addEventListener('pageshow', onWake)
+    window.addEventListener('online', onOnline)
+    return () => {
+      document.removeEventListener('visibilitychange', onWake)
+      window.removeEventListener('focus', onWake)
+      window.removeEventListener('pageshow', onWake)
+      window.removeEventListener('online', onOnline)
+    }
+  }, [resync])
+
+  /** The Computer panel's one action: redial and re-read the host. */
+  const wakeComputer = useCallback(() => {
+    const client = clientRef.current
+    if (!client) {
+      setBanner('No gateway connection is configured.')
+      return
+    }
+    setBanner('Waking the Hermes computer…')
+    client.reconnectNow()
+    void refreshStatus()
+    setTimeout(() => {
+      setBanner(
+        clientRef.current?.isOpen
+          ? 'Hermes computer is awake — the chat is back in sync.'
+          : 'No answer from the Hermes computer yet. Check that it is on and reachable.',
+      )
+    }, 6_000)
+  }, [refreshStatus])
+
+  const allowBackground = useCallback(() => {
+    void requestBatteryExemption().then(setKeepAlive)
   }, [])
 
   // -------------------------------------------------------------- commands ---
@@ -748,7 +926,11 @@ export default function App() {
       <Drawer
         open={drawerOpen}
         tab={drawerTab}
-        onTab={setDrawerTab}
+        onTab={(next) => {
+          setDrawerTab(next)
+          // The Computer tab is the only view of the host: refresh on open.
+          if (next === 'computer') void refreshStatus()
+        }}
         sessions={store.sessions}
         order={store.order}
         activeId={store.activeId}
@@ -764,10 +946,14 @@ export default function App() {
           if (activeConnectionRef.current) void storage.saveProfile(activeConnectionRef.current.id, name)
           setDrawerTab('sessions')
           void (async () => {
+            // Re-read the roster first: `last_session` is what the desktop app was
+            // last in, and the copy held in state can be from before a reconnect.
+            // Resuming from a stale roster was what made the bot switch fail.
+            const roster = await refreshProfiles()
             const stored = await refreshDiscovery(name)
             // Switching bot resumes that bot's own conversation rather than
             // leaving the previous bot's chat on screen.
-            await resumeLastChat(profiles, stored, name)
+            await resumeLastChat(roster, stored, name)
           })()
         }}
         onNewChat={newChat}
@@ -776,6 +962,18 @@ export default function App() {
           setSettingsOpen(true)
         }}
         onRefresh={refreshDiscovery}
+        connectionName={activeConnection.name}
+        baseUrl={activeConnection.baseUrl}
+        authMode={activeConnection.authMode}
+        connState={connState}
+        connDetail={connDetail}
+        gatewayStatus={gatewayStatus}
+        statusLoading={statusLoading}
+        statusAt={statusAt}
+        keepAlive={keepAlive}
+        onRefreshStatus={refreshStatus}
+        onWake={wakeComputer}
+        onRequestExemption={allowBackground}
       />
     </div>
   )

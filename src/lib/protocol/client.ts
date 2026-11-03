@@ -65,6 +65,8 @@ export const ABNORMAL_CLOSE = 1006
 const DEFAULT_REQUEST_TIMEOUT_MS = 30_000
 const HEARTBEAT_MS = 15_000
 const READY_TIMEOUT_MS = 10_000
+/** Missed pings in a row before the socket is declared dead and redialled. */
+const HEARTBEAT_FAILURES = 2
 
 interface Pending {
   resolve: (value: unknown) => void
@@ -114,6 +116,10 @@ export class GatewayClient {
   private heartbeatTimer: ReturnType<typeof setInterval> | null = null
   private readyTimer: ReturnType<typeof setTimeout> | null = null
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null
+  /** Consecutive unanswered pings; a locked phone leaves the socket half-open. */
+  private missedPings = 0
+  /** Wall clock of the last frame the gateway sent, used to spot a silent socket. */
+  private lastFrameAt = 0
   state: ConnectionState = 'idle'
   /** Server request methods this backend says it may send (from client.capabilities). */
   serverRequestMethods: string[] = []
@@ -153,9 +159,17 @@ export class GatewayClient {
         credential = await this.credential()
       }
     } catch (err) {
-      // A refused sign-in is not a transient network fault: retrying would hammer
-      // the gateway with credentials. Surface it and let the user fix Settings.
       this.dialling = false
+      // A refused sign-in is not a transient fault: retrying would hammer the
+      // gateway with credentials, so surface it and let the user fix Settings.
+      // An unreachable host is the opposite — a phone coming out of a locked
+      // screen routinely has no route yet, and parking the app on auth_failed
+      // there is what left it disconnected until Settings was opened by hand.
+      if ((err as Error)?.name === 'NetworkError') {
+        this.setState('reconnecting', (err as Error).message || 'unreachable')
+        this.scheduleReconnect()
+        return
+      }
       this.setState('auth_failed', (err as Error).message || 'sign-in failed')
       return
     }
@@ -200,6 +214,8 @@ export class GatewayClient {
     }
 
     socket.onmessage = (event: MessageEvent<string>) => {
+      this.lastFrameAt = Date.now()
+      this.missedPings = 0
       this.handleFrame(event.data)
     }
 
@@ -208,6 +224,9 @@ export class GatewayClient {
     }
 
     socket.onclose = (event: CloseEvent) => {
+      // A socket that was already replaced (reconnectNow, close) must not drive
+      // state or schedule another dial: its close is the echo of our own action.
+      if (this.ws !== socket) return
       this.stopHeartbeat()
       if (this.readyTimer) {
         clearTimeout(this.readyTimer)
@@ -266,12 +285,67 @@ export class GatewayClient {
     this.setState('closed')
   }
 
+  /** Is there a live socket right now? */
+  get isOpen(): boolean {
+    return !!this.ws && this.ws.readyState === WebSocket.OPEN && this.ready
+  }
+
+  /** How long since the gateway last said anything (ms), or Infinity if never. */
+  get silenceMs(): number {
+    return this.lastFrameAt ? Date.now() - this.lastFrameAt : Number.POSITIVE_INFINITY
+  }
+
+  /**
+   * Drop whatever socket we have and dial again immediately.
+   *
+   * Android freezes the WebView when the phone locks, so the socket can be gone
+   * without `onclose` ever firing — the UI then sits on "connected" while the
+   * gateway streams into the void. On resume the app calls this instead of
+   * trusting the socket's readyState, which is exactly what makes the chat pick
+   * up where the gateway actually is.
+   */
+  reconnectNow() {
+    if (this.dialling) return
+    if (this.reconnectTimer) {
+      clearTimeout(this.reconnectTimer)
+      this.reconnectTimer = null
+    }
+    const stale = this.ws
+    this.ws = null
+    if (stale) {
+      try {
+        stale.close()
+      } catch {
+        /* ignore */
+      }
+    }
+    this.stopHeartbeat()
+    this.rejectAll(new Error('reconnecting'))
+    this.ready = false
+    this.advertised = false
+    this.attempt = 0
+    this.missedPings = 0
+    this.setState('reconnecting')
+    void this.dial()
+  }
+
   private startHeartbeat() {
     this.stopHeartbeat()
+    this.missedPings = 0
     this.heartbeatTimer = setInterval(() => {
-      void this.request('ping', {}, 8_000).catch(() => {
-        // A dead socket surfaces on onclose; ignore transient ping failures.
-      })
+      void this.request('ping', {}, 8_000).then(
+        () => {
+          this.missedPings = 0
+        },
+        () => {
+          // One missed ping is noise; two in a row means the socket is a ghost.
+          this.missedPings += 1
+          if (this.missedPings >= HEARTBEAT_FAILURES) {
+            this.missedPings = 0
+            this.reconnectNow()
+          }
+        },
+      )
     }, HEARTBEAT_MS)
   }
 

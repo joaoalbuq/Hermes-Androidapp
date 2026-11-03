@@ -39,6 +39,20 @@ export class AuthError extends Error {
   }
 }
 
+/**
+ * The gateway could not be reached at all (host down, radio asleep, no route).
+ *
+ * Deliberately distinct from AuthError: a credential that was refused must stop
+ * the client and ask the user, while a transport failure is exactly what a phone
+ * hits after a locked screen and has to retry on its own.
+ */
+export class NetworkError extends AuthError {
+  constructor(message: string) {
+    super(message)
+    this.name = 'NetworkError'
+  }
+}
+
 interface HttpResult {
   status: number
   data: unknown
@@ -114,7 +128,7 @@ async function httpJson(
       })
       return { status: res.status, data: res.data, headers: lowerHeaders(res.headers) }
     } catch (err) {
-      throw new AuthError(networkMessage(err))
+      throw new NetworkError(networkMessage(err))
     }
   }
 
@@ -128,7 +142,7 @@ async function httpJson(
       credentials: 'include',
     })
   } catch (err) {
-    throw new AuthError(networkMessage(err))
+    throw new NetworkError(networkMessage(err))
   }
   const text = await response.text()
   let data: unknown = null
@@ -160,6 +174,47 @@ function cookiePairs(headers: Record<string, string>): string {
 export function apiUrl(baseUrl: string, path: string): string {
   const base = resolveBaseUrl(baseUrl).replace(/\/+$/, '')
   return `${base}${path.startsWith('/') ? path : `/${path}`}`
+}
+
+/** What the gateway's own `/api/status` reports about the machine running it. */
+export interface GatewayStatusPayload {
+  status?: string
+  version?: string
+  uptime_s?: number
+  hostname?: string
+  platform?: string
+  profiles?: { name?: string; running?: boolean }[] | Record<string, unknown>
+  [key: string]: unknown
+}
+
+export interface GatewayStatusResult {
+  httpStatus: number
+  data: GatewayStatusPayload
+  error?: string
+}
+
+/**
+ * Read `/api/status` over HTTP.
+ *
+ * This is the only view of the Hermes computer itself (the machine running the
+ * gateway): the WebSocket contract carries sessions, not host health. A gated
+ * gateway wants the sign-in cookie, a loopback one the session token header, so
+ * the caller passes whichever it has.
+ */
+export async function fetchGatewayStatus(
+  baseUrl: string,
+  headers: Record<string, string> = {},
+): Promise<GatewayStatusResult> {
+  const result = await httpJson('GET', apiUrl(baseUrl, '/api/status'), undefined, headers)
+  const data = (result.data && typeof result.data === 'object' ? result.data : {}) as GatewayStatusPayload
+  return {
+    httpStatus: result.status,
+    data,
+    error:
+      result.status >= 400
+        ? `gateway answered ${result.status}${errorDetail(result) ? `: ${errorDetail(result)}` : ''}`
+        : undefined,
+  }
 }
 
 /**

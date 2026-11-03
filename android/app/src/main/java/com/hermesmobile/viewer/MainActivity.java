@@ -8,8 +8,9 @@ public class MainActivity extends BridgeActivity {
     @Override
     public void onCreate(Bundle savedInstanceState) {
         // Must be registered before the bridge starts, or the JS side resolves
-        // "Downloads" to an unimplemented plugin and every save fails.
+        // "Downloads" / "KeepAlive" to unimplemented plugins and every call fails.
         registerPlugin(DownloadsPlugin.class);
+        registerPlugin(KeepAlivePlugin.class);
         super.onCreate(savedInstanceState);
     }
 }

@@ -10,6 +10,14 @@ nothing server-side. The only setup is a gateway URL and a token.
 
 ---
 
+## Get it without building
+
+A built debug APK is attached to the GitHub release:
+
+<https://github.com/joaoalbuq/Hermes-Androidapp/releases/download/v1.0/hermes-mobile-1.0-debug.apk>
+
+Repo: <https://github.com/joaoalbuq/Hermes-Androidapp>
+
 ## Build the APK
 
 Prerequisites on the build machine: **Node 20+**, **JDK 21**, **Android SDK** (platform 36,

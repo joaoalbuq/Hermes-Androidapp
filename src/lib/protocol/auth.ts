@@ -258,9 +258,18 @@ export class PasswordAuthSession {
 
   /** The HTTP leg: GET /api/status, authenticated with the same cookie. */
   async status(): Promise<HttpResult> {
+    return httpJson('GET', apiUrl(this.baseUrl, '/api/status'), undefined, await this.httpHeaders())
+  }
+
+  /**
+   * Cookie header for any other REST call on this gateway (file downloads).
+   *
+   * Gated gateways admit `/api/fs/*` with the sign-in cookie — the same session
+   * the ticket is minted from — so nothing else has to be plumbed through.
+   */
+  async httpHeaders(): Promise<Record<string, string>> {
     const cookie = await this.ensureCookie()
-    const headers: Record<string, string> = cookie ? { Cookie: cookie } : {}
-    return httpJson('GET', apiUrl(this.baseUrl, '/api/status'), undefined, headers)
+    return cookie ? { Cookie: cookie } : {}
   }
 
   async signOut(): Promise<void> {
@@ -294,8 +303,11 @@ export class CookieAuthSession {
   }
 
   async status(): Promise<HttpResult> {
-    const headers: Record<string, string> = this.cookie ? { Cookie: this.cookie } : {}
-    return httpJson('GET', apiUrl(this.baseUrl, '/api/status'), undefined, headers)
+    return httpJson('GET', apiUrl(this.baseUrl, '/api/status'), undefined, await this.httpHeaders())
+  }
+
+  async httpHeaders(): Promise<Record<string, string>> {
+    return this.cookie ? { Cookie: this.cookie } : {}
   }
 }
 

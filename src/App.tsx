@@ -10,6 +10,13 @@ import {
   type SessionAttachResult,
   type SessionListRow,
 } from './lib/protocol/types'
+import {
+  MAX_TRANSFER_BYTES,
+  fetchGatewayFile,
+  fileToBase64,
+  type StagedAttachment,
+} from './lib/protocol/files'
+import { saveBase64File } from './lib/native/downloads'
 import { initialStore, reducer } from './state'
 import { useReducer } from 'react'
 import * as storage from './lib/storage'
@@ -59,6 +66,8 @@ export default function App() {
   const attachErrorRef = useRef<string | null>(null)
   /** Durable id -> runtime handle of the current attach, for events and RPCs. */
   const runtimeByKey = useRef(new Map<string, string>())
+  /** The signed-in session, for REST calls that are not JSON-RPC (downloads). */
+  const httpAuthRef = useRef<{ httpHeaders: () => Promise<Record<string, string>> } | null>(null)
 
   /** Fold a runtime handle back onto the durable id the store is keyed by. */
   const durableKeyFor = useCallback((id: string | null): string | null => {
@@ -301,6 +310,8 @@ export default function App() {
       let credential: (() => Promise<Credential>) | undefined
       if (cookieSession) credential = () => cookieSession.credential()
       else if (passwordSession) credential = () => passwordSession.credential()
+      // File downloads are plain REST: they reuse the same session cookie.
+      httpAuthRef.current = cookieSession || passwordSession || null
 
       clientRef.current?.close()
       clientRef.current = null
@@ -489,6 +500,111 @@ export default function App() {
     }
   }, [])
 
+  /**
+   * Stage picked files for the next prompt.
+   *
+   * The legacy wire has no `attachments` field on prompt.submit — it is rejected as
+   * an unknown param — so each file is staged by its own RPC first and the prompt
+   * then carries the `@file:` reference the gateway hands back. Images are queued
+   * in one call (the model sees them next turn); anything else returns a reference.
+   */
+  const stageFiles = useCallback(async (files: File[]): Promise<StagedAttachment[]> => {
+    const client = clientRef.current
+    const key = activeSessionRef.current
+    if (!client) throw new Error('not connected to the gateway')
+    if (!key) throw new Error('open a chat before attaching a file')
+    // Staging is addressed at the live chat, so it needs the runtime handle.
+    const sessionId = runtimeByKey.current.get(key) || key
+    const profile = profileRef.current
+    const staged: StagedAttachment[] = []
+
+    for (const file of files) {
+      if (file.size > MAX_TRANSFER_BYTES) {
+        setBanner(
+          `${file.name} is too large to send (${Math.round(file.size / 1024 / 1024)} MB, limit ${Math.round(
+            MAX_TRANSFER_BYTES / 1024 / 1024,
+          )} MB).`,
+        )
+        continue
+      }
+      const mime = file.type || 'application/octet-stream'
+      const base64 = await fileToBase64(file)
+      const id = `att-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`
+
+      if (mime.startsWith('image/')) {
+        try {
+          await client.request('image.attach_bytes', {
+            session_id: sessionId,
+            profile,
+            content_base64: base64,
+            filename: file.name,
+          })
+          staged.push({ id, name: file.name, refText: '', kind: 'image', size: file.size })
+          continue
+        } catch (err) {
+          // Builds without the image verb still have file.attach: stage it there.
+          if (!isUnknownMethod(err)) {
+            setBanner(`Could not attach ${file.name}: ${(err as Error).message}`)
+            throw err
+          }
+        }
+      }
+
+      try {
+        const result = await client.request<{
+          attached?: boolean
+          name?: string
+          ref_text?: string
+          ref_path?: string
+        }>('file.attach', {
+          session_id: sessionId,
+          profile,
+          data_url: `data:${mime};base64,${base64}`,
+          name: file.name,
+        })
+        staged.push({
+          id,
+          name: result?.name || file.name,
+          refText: result?.ref_text || (result?.ref_path ? `@file:${result.ref_path}` : ''),
+          kind: 'file',
+          size: file.size,
+        })
+      } catch (err) {
+        setBanner(
+          isUnknownMethod(err)
+            ? 'This gateway build has no file.attach, so files cannot be sent from the phone.'
+            : `Could not attach ${file.name}: ${(err as Error).message}`,
+        )
+        throw err
+      }
+    }
+    return staged
+  }, [])
+
+  /** Pull a file the agent produced onto the phone. */
+  const downloadFile = useCallback(async (path: string) => {
+    const connection = activeConnectionRef.current
+    if (!connection) return
+    const auth = httpAuthRef.current
+    const name = path.split(/[/\\]/).pop() || 'file'
+    setBanner(`Downloading ${name}…`)
+    try {
+      const headers = auth ? await auth.httpHeaders() : {}
+      const file = await fetchGatewayFile({
+        baseUrl: connection.baseUrl,
+        path,
+        profile: profileRef.current,
+        // The durable id: /api/fs/download checks the session belongs to the profile.
+        sessionId: activeSessionRef.current,
+        headers,
+      })
+      const saved = await saveBase64File(file.name, file.mime, file.base64)
+      setBanner(`Saved ${saved.name} to ${saved.location}.`)
+    } catch (err) {
+      setBanner(`Download failed: ${(err as Error).message}`)
+    }
+  }, [])
+
   const answerPrompt = useCallback((id: string, result: Record<string, unknown>) => {
     const resolve = resolvers.current.get(id)
     resolvers.current.delete(id)
@@ -616,6 +732,8 @@ export default function App() {
           onSend={sendPrompt}
           onInterrupt={interrupt}
           onAnswer={answerPrompt}
+          onAttach={stageFiles}
+          onDownload={downloadFile}
         />
       ) : (
         <div className="empty">

@@ -1,5 +1,6 @@
 import { useEffect, useLayoutEffect, useRef, useState } from 'react'
 import type { SessionState } from '../state'
+import { splitMedia, type StagedAttachment } from '../lib/protocol/files'
 import Prompts from './Prompts'
 
 interface Props {
@@ -10,10 +11,48 @@ interface Props {
   onSend: (text: string, steer: boolean) => Promise<void> | void
   onInterrupt: () => Promise<void> | void
   onAnswer: (id: string, result: Record<string, unknown>) => void
+  onAttach: (files: File[]) => Promise<StagedAttachment[]>
+  onDownload: (path: string) => Promise<void> | void
 }
 
 /** Distance from the bottom (px) that still counts as "at the bottom". */
 const FOLLOW_THRESHOLD = 72
+
+/**
+ * Assistant text plus any file the agent delivered.
+ *
+ * A tool can hand back a file as a `MEDIA:/path` tag in its prose. The tag is not
+ * something to show the user, so it becomes a download chip instead.
+ */
+function MessageBody({
+  text,
+  onDownload,
+}: {
+  text: string
+  onDownload: (path: string) => Promise<void> | void
+}) {
+  const { text: prose, files } = splitMedia(text)
+  return (
+    <>
+      {prose ? <div className="bubble-text">{prose}</div> : null}
+      {files.length > 0 ? (
+        <div className="file-chips">
+          {files.map((file) => (
+            <button
+              key={file.path}
+              className="file-chip"
+              title={file.path}
+              onClick={() => void onDownload(file.path)}
+            >
+              <span className="file-chip-icon">⬇</span>
+              <span className="file-chip-name">{file.name}</span>
+            </button>
+          ))}
+        </div>
+      ) : null}
+    </>
+  )
+}
 
 export default function Chat({
   session,
@@ -23,11 +62,16 @@ export default function Chat({
   onSend,
   onInterrupt,
   onAnswer,
+  onAttach,
+  onDownload,
 }: Props) {
   const scrollRef = useRef<HTMLDivElement>(null)
+  const fileInputRef = useRef<HTMLInputElement>(null)
   const [follow, setFollow] = useState(true)
   const [text, setText] = useState('')
   const [sending, setSending] = useState(false)
+  const [attachments, setAttachments] = useState<StagedAttachment[]>([])
+  const [staging, setStaging] = useState(false)
   const running = session.running || session.streaming
 
   // Scroll-follow, copied from the desktop's behaviour: stay pinned while the
@@ -59,14 +103,34 @@ export default function Chat({
     setFollow(true)
   }
 
+  /** Stage picked files now; they ride along with whatever is sent next. */
+  const pickFiles = async (files: File[]) => {
+    if (files.length === 0) return
+    setStaging(true)
+    try {
+      const staged = await onAttach(files)
+      if (staged.length > 0) setAttachments((list) => [...list, ...staged])
+    } catch {
+      // The App put the reason in the banner already.
+    } finally {
+      setStaging(false)
+    }
+  }
+
   const submit = async () => {
     const value = text.trim()
-    if (!value || sending) return
+    if ((!value && attachments.length === 0) || sending) return
     setSending(true)
     setFollow(true)
+    // A staged file is announced to the agent through its own reference line; the
+    // queued image needs no text beyond whatever the user typed.
+    const refs = attachments.map((attachment) => attachment.refText).filter(Boolean)
+    const payload =
+      [...refs, value].filter(Boolean).join('\n\n') || 'See the attached file.'
     setText('')
+    setAttachments([])
     try {
-      await onSend(value, running)
+      await onSend(payload, running)
     } finally {
       setSending(false)
     }
@@ -91,7 +155,7 @@ export default function Chat({
           if (item.kind === 'assistant') {
             return (
               <div key={item.id} className="bubble bubble-assistant">
-                {item.text}
+                <MessageBody text={item.text} onDownload={onDownload} />
               </div>
             )
           }
@@ -142,7 +206,49 @@ export default function Chat({
 
       <div className="composer-wrap">
         <Prompts prompts={session.prompts} onAnswer={onAnswer} />
+        {attachments.length > 0 || staging ? (
+          <div className="attach-row">
+            {attachments.map((attachment) => (
+              <span key={attachment.id} className="attach-chip">
+                <span className="attach-chip-icon">{attachment.kind === 'image' ? '🖼' : '📄'}</span>
+                <span className="attach-chip-name">{attachment.name}</span>
+                <button
+                  className="attach-chip-remove"
+                  aria-label={`Remove ${attachment.name}`}
+                  onClick={() =>
+                    setAttachments((list) => list.filter((item) => item.id !== attachment.id))
+                  }
+                >
+                  ✕
+                </button>
+              </span>
+            ))}
+            {staging ? <span className="attach-chip attach-chip-busy">uploading…</span> : null}
+          </div>
+        ) : null}
         <div className="composer">
+          <input
+            ref={fileInputRef}
+            className="attach-input"
+            type="file"
+            multiple
+            disabled={!connected}
+            onChange={(event) => {
+              const picked = Array.from(event.target.files || [])
+              // Reset so picking the same file twice still fires a change event.
+              event.target.value = ''
+              void pickFiles(picked)
+            }}
+          />
+          <button
+            className="attach-button"
+            aria-label="Attach a file"
+            title="Attach a file"
+            disabled={!connected || staging}
+            onClick={() => fileInputRef.current?.click()}
+          >
+            📎
+          </button>
           <textarea
             className="composer-input"
             rows={1}
@@ -168,7 +274,11 @@ export default function Chat({
               Stop
             </button>
           ) : null}
-          <button className="primary" disabled={!connected || !text.trim() || sending} onClick={submit}>
+          <button
+            className="primary"
+            disabled={!connected || (!text.trim() && attachments.length === 0) || sending}
+            onClick={submit}
+          >
             {running ? 'Steer' : 'Send'}
           </button>
         </div>

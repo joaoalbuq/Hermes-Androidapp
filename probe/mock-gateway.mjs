@@ -145,6 +145,31 @@ const STORED_SESSIONS = [
   },
 ]
 
+/**
+ * Files the fixture can serve over /api/fs/download, addressed by the same
+ * absolute paths a MEDIA: tag would carry.
+ */
+const MOCK_FILES = new Map([
+  [
+    '/srv/app/report.txt',
+    {
+      name: 'migration-report.txt',
+      mime: 'text/plain; charset=utf-8',
+      body: 'migration 0042_auth_tokens\n420 rows written\nfinished in 1.8s\n',
+    },
+  ],
+  [
+    '/srv/app/coverage.png',
+    {
+      name: 'coverage.png',
+      mime: 'image/png',
+      // 1x1 transparent PNG, enough to prove bytes survive the round trip.
+      base64:
+        'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==',
+    },
+  ],
+])
+
 const profileOf = (profile) => profile || 'default'
 const storedFor = (idOrTitle, profile) =>
   STORED_SESSIONS.find(
@@ -456,6 +481,39 @@ function createSocketBridge(socket) {
         streamTurn(runtimeId)
         return
       }
+      case 'file.attach': {
+        // The legacy wire has no attachments field on prompt.submit: a file is
+        // staged here and the prompt then carries the returned @file: ref.
+        const name = String(params?.name || 'upload.bin')
+        const safe = name.replace(/[^\w.\-]+/g, '_')
+        const refPath = `uploads/web-${randomUUID().slice(0, 8)}-${safe}`
+        const size = params?.data_url ? Buffer.byteLength(String(params.data_url), 'utf8') : 0
+        console.log(`[mock] staged file ${name} via ${params?.data_url ? 'data_url' : 'path'} (${size} b64 chars)`)
+        respond(id, {
+          attached: true,
+          name,
+          path: `/srv/app/${refPath}`,
+          ref_path: refPath,
+          ref_text: `@file:${refPath}`,
+          uploaded: true,
+        })
+        return
+      }
+      case 'image.attach_bytes': {
+        const name = String(params?.filename || 'image.png')
+        const bytes = params?.content_base64
+          ? Buffer.from(String(params.content_base64), 'base64').length
+          : 0
+        console.log(`[mock] staged image ${name} (${bytes} bytes decoded)`)
+        respond(id, {
+          attached: true,
+          name,
+          path: `/srv/app/uploads/${name}`,
+          mime: 'image/png',
+          bytes,
+        })
+        return
+      }
       case 'prompt.submit': {
         const stored = runtimeToStored.get(params?.session_id)
         if (!stored) {
@@ -519,7 +577,10 @@ function createSocketBridge(socket) {
           })
           later(() => {
             sendEvent('message.complete', sessionId, {
-              text: chunks.join(''),
+              // A delivered file rides in the prose as a MEDIA tag, exactly as the
+              // agent emits it; the client turns that into a download chip.
+              text: `${chunks.join('')} Report: MEDIA:/srv/app/report.txt`,
+              
               status: 'completed',
               usage: { input_tokens: 1200, output_tokens: 340 },
             })
@@ -544,6 +605,8 @@ const server = createServer((req, res) => {
     res.setHeader('access-control-allow-origin', origin)
     res.setHeader('access-control-allow-credentials', 'true')
     res.setHeader('vary', 'Origin')
+    // The download helper reads the server's filename out of this header.
+    res.setHeader('access-control-expose-headers', 'content-disposition, content-length, content-type')
   }
   if (req.method === 'OPTIONS') {
     res.setHeader('access-control-allow-headers', 'content-type, x-hermes-session-token')
@@ -616,6 +679,31 @@ const server = createServer((req, res) => {
     )
     return
   }
+  // File downloads: cookie-authenticated REST, as a gated gateway serves them.
+  if ((path === '/api/fs/download' || path === '/api/files/download') && req.method === 'GET') {
+    if (!signedIn) {
+      res.writeHead(401, { 'content-type': 'application/json' })
+      res.end(JSON.stringify({ error: 'unauthenticated', detail: 'Unauthorized' }))
+      return
+    }
+    const params = new URL(req.url || '/', 'http://localhost').searchParams
+    const file = MOCK_FILES.get(params.get('path') || '')
+    if (!file) {
+      res.writeHead(404, { 'content-type': 'application/json' })
+      res.end(JSON.stringify({ error: 'not found' }))
+      return
+    }
+    const bytes = file.base64 ? Buffer.from(file.base64, 'base64') : Buffer.from(file.body, 'utf8')
+    console.log(`[mock] download ${params.get('path')} -> ${file.name} (${bytes.length} bytes)`)
+    res.writeHead(200, {
+      'content-type': file.mime,
+      'content-length': bytes.length,
+      'content-disposition': `attachment; filename="${file.name}"`,
+    })
+    res.end(bytes)
+    return
+  }
+
   res.writeHead(404, { 'content-type': 'application/json' })
   res.end(JSON.stringify({ error: 'not found' }))
 })

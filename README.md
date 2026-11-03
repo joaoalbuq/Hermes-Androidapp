@@ -14,7 +14,7 @@ nothing server-side. The only setup is a gateway URL and a token.
 
 A built debug APK is attached to the GitHub release:
 
-<https://github.com/joaoalbuq/Hermes-Androidapp/releases/download/v1.1/hermes-mobile-1.1-debug.apk>
+<https://github.com/joaoalbuq/Hermes-Androidapp/releases/download/v1.2/hermes-mobile-1.2-debug.apk>
 
 Repo: <https://github.com/joaoalbuq/Hermes-Androidapp>
 
@@ -122,9 +122,16 @@ means a proxy, firewall, or the gateway's auth/Origin guard is refusing `/api/ws
 - **Sessions** — `session.list` (saved transcripts) merged with `session.active_list` (live in the
   gateway process), with live status, unread counts, and a search box.
 - **Bots** — the profile roster from `profiles.list`. Selecting one scopes discovery to that profile.
-- **Attach to a running turn** — `session.activate` returns `inflight` (the turn history does not
-  hold yet) and `open_requests` (questions still awaiting an answer). Both are re-rendered on
-  attach, so you land mid-turn exactly where the gateway is.
+- **Attach to a running turn** — `session.resume` (falling back to `session.activate` on older
+  builds) returns `inflight` (the turn history does not hold yet) and `open_requests` (questions
+  still awaiting an answer). Both are re-rendered on attach, so you land mid-turn exactly where the
+  gateway is, whether or not the chat was live when the app opened.
+- **Sending files** — 📎 in the composer stages a picked file with `image.attach_bytes` (images) or
+  `file.attach` (anything else) and sends the returned `@file:` reference with the next prompt,
+  since `prompt.submit` has no attachments field on this wire.
+- **Pulling files down** — a `MEDIA:/path` tag in the agent's reply becomes a ⬇ chip; tapping it
+  downloads the file through `/api/fs/download` (cookie-authenticated) and writes it into the
+  phone's Downloads folder via a small native MediaStore plugin.
 - **Live streaming** — `message.delta` token by token, `tool.start` / `tool.complete` as live tool
   activity (never raw JSON), plus `message.complete`, `session.title`, `session.info`, `error`.
 - **Answering the agent** — `approval`, `clarify`, `sudo`, `secret`, `vault.code`,
@@ -144,7 +151,7 @@ means a proxy, firewall, or the gateway's auth/Origin guard is refusing `/api/ws
   rebinding) — left out cleanly rather than half-built.
 - Server-side installs, gateway config, plugin/MCP management.
 - OAuth / Nous Portal sign-in: token auth only.
-- Images, voice, and file attachments.
+- Voice input / dictation. (File and image attachments arrived in 1.2.)
 - All connections connected concurrently (Desktop keeps every gateway dialled; this app keeps the
   active one connected and remembers the rest).
 - Server-side full-text search: search covers discovered sessions and messages already loaded.

@@ -451,6 +451,102 @@ code {
   padding-left: 2px;
 }
 
+/* The picker stays in the DOM (a click() on it opens the native sheet) but is
+   never drawn: the 📎 button is its visible face. */
+.attach-input {
+  display: none;
+}
+
+.attach-button {
+  flex: none;
+  width: 38px;
+  height: 38px;
+  border-radius: 11px;
+  border: 1px solid var(--border);
+  background: var(--bg-card);
+  font-size: 17px;
+  line-height: 1;
+}
+
+.attach-button:disabled {
+  opacity: 0.45;
+}
+
+.attach-row,
+.file-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.attach-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  max-width: 100%;
+  padding: 4px 8px;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+  background: var(--bg-card);
+  font-size: 12px;
+}
+
+.attach-chip-name {
+  max-width: 46vw;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.attach-chip-icon {
+  font-size: 12px;
+}
+
+.attach-chip-remove {
+  color: var(--muted);
+  font-size: 11px;
+  padding: 0 2px;
+}
+
+.attach-chip-busy {
+  color: var(--muted);
+  font-style: italic;
+}
+
+/* A file the agent delivered: tap to pull it onto the phone. */
+.file-chips {
+  margin-top: 8px;
+}
+
+.file-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  max-width: 100%;
+  padding: 7px 11px;
+  border-radius: 10px;
+  border: 1px solid #2c4f74;
+  background: #12253a;
+  color: var(--text);
+  font-size: 12.5px;
+  text-align: left;
+}
+
+.file-chip-icon {
+  color: var(--accent);
+  font-size: 13px;
+}
+
+.file-chip-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.bubble-text {
+  white-space: pre-wrap;
+}
+
 /* -------------------------------------------------------------- prompts --- */
 
 .prompts {

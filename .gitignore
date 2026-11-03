@@ -1,0 +1,24 @@
+node_modules/
+dist/
+.DS_Store
+*.log
+*.tsbuildinfo
+
+# Project-local JDK + Android SDK (bash scripts/fetch-toolchain.sh)
+.toolchain/
+
+# Native build output (the Android project itself IS tracked; Gradle's cache is not)
+android/.gradle/
+android/build/
+android/app/build/
+android/local.properties
+android/app/src/main/assets/public/
+android/app/src/main/assets/capacitor.config.json
+
+# Never commit credentials
+.env
+.env.*
+*.keystore
+!*.keystore.example
+.tmp/
+apk/*.apk

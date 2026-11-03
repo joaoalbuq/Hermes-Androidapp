@@ -1,0 +1,33 @@
+{
+  "name": "hermes-mobile",
+  "private": true,
+  "version": "0.1.0",
+  "description": "Mobile viewer for an existing Hermes gateway (sessions, bots, live turn attach)",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc -b && vite build",
+    "preview": "vite preview",
+    "probe": "node probe/probe.mjs",
+    "mock": "node probe/mock-gateway.mjs",
+    "android:add": "cap add android",
+    "android:sync": "npm run build && cap sync android"
+  },
+  "dependencies": {
+    "@aparajita/capacitor-secure-storage": "^8.0.1",
+    "@capacitor/android": "^8.6.0",
+    "@capacitor/core": "^8.6.0",
+    "@capacitor/inappbrowser": "^4.1.0",
+    "@capacitor/preferences": "^8.0.1",
+    "react": "^19.3.1",
+    "react-dom": "^19.3.1"
+  },
+  "devDependencies": {
+    "@capacitor/cli": "^8.6.0",
+    "@types/react": "^19.3.0",
+    "@types/react-dom": "^19.3.0",
+    "@vitejs/plugin-react": "^6.2.1",
+    "typescript": "^7.0.2",
+    "vite": "^8.3.5"
+  }
+}

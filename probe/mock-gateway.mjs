@@ -541,6 +541,16 @@ function createSocketBridge(socket) {
         return
       }
       case 'command.dispatch': {
+        // Probe switches for the two failure shapes the client must tell apart:
+        // an absent method (fall back to config) and a refusal (surface it).
+        if (process.argv.includes('--no-command-dispatch')) {
+          respondError(id, -32601, 'method not found')
+          return
+        }
+        if (process.argv.includes('--reject-commands')) {
+          respondError(id, 4004, `unknown model: ${String(params?.arg || '')}`)
+          return
+        }
         // Slash commands are how the gateway changes model and reasoning: there
         // is no session.set_model. Params are {name, arg, session_id, profile}.
         if (!params || typeof params.name !== 'string') {
@@ -564,6 +574,20 @@ function createSocketBridge(socket) {
           console.log(`[mock] model -> ${arg} for ${stored.id}`)
           respond(id, { type: 'exec', output: `Model set to ${arg}.` })
           sendEvent('session.info', params.session_id, infoFor(stored))
+          if (process.argv.includes('--cross-chat-info')) {
+            // A second client touching another chat, replayed as a session.info on
+            // a handle this client never attached: the app must ignore it rather
+            // than rewriting the chat that happens to be open.
+            console.log('[mock] emitting foreign session.info rt-999')
+            sendEvent('session.info', 'rt-999', {
+              model: 'totally-other-model',
+              provider: 'openai',
+              reasoning_effort: 'ultra',
+              reasoning_effort_wire: 'ultra',
+              title: 'Somebody else\u2019s chat',
+              running: false,
+            })
+          }
           return
         }
         if (name === 'reasoning') {

@@ -119,7 +119,14 @@ async function dispatch(
   }
   if (options.profile) params.profile = options.profile
   const result = await client.request<CommandDispatchResult>('command.dispatch', params)
-  return textOf(result)
+  const text = textOf(result)
+  // A slash command can report its own failure as output ("Unknown model …",
+  // "not available for this profile"). Treating that as success is what left the
+  // pill claiming a model the session was never switched to.
+  if (/^\s*(unknown|invalid|error|failed|cannot|can't|no such|not available)\b/i.test(text)) {
+    throw new Error(text)
+  }
+  return text
 }
 
 export interface ChangeResult {
@@ -134,13 +141,25 @@ export interface ChangeResult {
  * Pin a model on the open chat.
  *
  * `/model` is the documented mid-session switch and is persistent for the
- * session. Builds without `command.dispatch` (or a gateway whose slash worker is
- * not running) fall back to `config.set` with `session_id`, which pins the live
- * session's model directly.
+ * session. Only a gateway that has no `command.dispatch` at all falls back to
+ * `config.set`, and the fallback addresses the session by its DURABLE id (config
+ * is stored per session file) rather than the runtime handle.
+ *
+ * Any other refusal — unknown model, busy session, no live session — is surfaced.
+ * Falling back on those was worse than an error: `config.set` resolved the target
+ * differently and wrote a different scope, so a chat pick silently changed the
+ * bot's default while the chat kept its model.
  */
 export async function applyModel(
   client: GatewayClient,
-  options: { sessionId: string; profile: string | null; model: string },
+  options: {
+    /** Runtime handle of the live attach — what command.dispatch addresses. */
+    sessionId: string
+    /** Durable id, for the config route and error messages. */
+    storedId?: string | null
+    profile: string | null
+    model: string
+  },
 ): Promise<ChangeResult> {
   try {
     const message = await dispatch(client, {
@@ -151,14 +170,14 @@ export async function applyModel(
     })
     return { ok: true, message: message || `Model set to ${options.model}.`, via: 'command' }
   } catch (err) {
-    if (!(err instanceof RpcCallError)) throw err
+    if (!isUnknownMethod(err)) throw err
     try {
       const result = await client.request<{ warning?: string | null; confirm_message?: string | null }>(
         'config.set',
         {
           key: 'model',
           value: options.model,
-          session_id: options.sessionId,
+          session_id: options.storedId || options.sessionId,
           ...(options.profile ? { profile: options.profile } : {}),
         },
       )
@@ -168,21 +187,30 @@ export async function applyModel(
         via: 'config',
       }
     } catch (fallbackErr) {
-      const first = (err as Error).message
-      const second = (fallbackErr as Error).message
       throw new Error(
-        isUnknownMethod(fallbackErr)
-          ? `This gateway cannot change the model from the phone: ${first}`
-          : `${first}${second && second !== first ? ` / ${second}` : ''}`,
+        `This gateway cannot change the model from the phone: ${(err as Error).message} / ${(fallbackErr as Error).message}`,
       )
     }
   }
 }
 
-/** Set the reasoning effort on the open chat (`/reasoning <level>`). */
+/**
+ * Set the reasoning effort on the open chat (`/reasoning <level>`).
+ *
+ * Same rule as the model: the config route is only for a gateway without
+ * `command.dispatch`, so a refused level is reported rather than being retargeted
+ * at whatever `config.set` resolves that session id to.
+ */
 export async function applyReasoning(
   client: GatewayClient,
-  options: { sessionId: string; profile: string | null; level: string },
+  options: {
+    /** Runtime handle of the live attach. */
+    sessionId: string
+    /** Durable id, for the config route. */
+    storedId?: string | null
+    profile: string | null
+    level: string
+  },
 ): Promise<ChangeResult> {
   try {
     const message = await dispatch(client, {
@@ -193,12 +221,12 @@ export async function applyReasoning(
     })
     return { ok: true, message: message || `Reasoning set to ${options.level}.`, via: 'command' }
   } catch (err) {
-    if (!(err instanceof RpcCallError)) throw err
+    if (!isUnknownMethod(err)) throw err
     try {
       const result = await client.request<{ warning?: string | null }>('config.set', {
         key: 'reasoning',
         value: options.level,
-        session_id: options.sessionId,
+        session_id: options.storedId || options.sessionId,
         ...(options.profile ? { profile: options.profile } : {}),
       })
       return {
@@ -207,12 +235,8 @@ export async function applyReasoning(
         via: 'config',
       }
     } catch (fallbackErr) {
-      const first = (err as Error).message
-      const second = (fallbackErr as Error).message
       throw new Error(
-        isUnknownMethod(fallbackErr)
-          ? `This gateway cannot change reasoning from the phone: ${first}`
-          : `${first}${second && second !== first ? ` / ${second}` : ''}`,
+        `This gateway cannot change reasoning from the phone: ${(err as Error).message} / ${(fallbackErr as Error).message}`,
       )
     }
   }

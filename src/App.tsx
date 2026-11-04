@@ -77,6 +77,9 @@ const isStaleSession = (err: unknown) =>
 const isUnknownMethod = (err: unknown) =>
   err instanceof RpcCallError && err.code === METHOD_NOT_FOUND
 
+/** 'ok' attached and moved the app; 'superseded' means a newer attach won. */
+type AttachOutcome = 'ok' | 'failed' | 'superseded'
+
 export default function App() {
   const [conns, setConns] = useState<storage.SavedConnection[]>([])
   const [activeConnectionId, setActiveConnectionId] = useState<string | null>(null)
@@ -97,9 +100,20 @@ export default function App() {
   const [statusLoading, setStatusLoading] = useState(false)
   const [statusAt, setStatusAt] = useState<number | null>(null)
   const [keepAlive, setKeepAlive] = useState<KeepAliveState>(NO_KEEPALIVE)
+  /** Newest model-inventory read wins; a slower answer for an older chat is dropped. */
+  const modelSeq = useRef(0)
+  /** Newest attach wins: two quick chat switches must not settle out of order. */
+  const attachSeq = useRef(0)
   /** Model + reasoning picker for the open chat. */
   const [modelSheetOpen, setModelSheetOpen] = useState(false)
-  const [modelOptions, setModelOptions] = useState<ModelOptions | null>(null)
+  /** The chat the sheet was opened for: every pick targets this, not "whatever is open". */
+  const [modelSheetKey, setModelSheetKey] = useState<string | null>(null)
+  /** The inventory, tagged with the chat + bot it was read for (it is per-session). */
+  const [modelInventory, setModelInventory] = useState<{
+    key: string | null
+    profile: string | null
+    options: ModelOptions
+  } | null>(null)
   const [modelLoading, setModelLoading] = useState(false)
   const [modelBusy, setModelBusy] = useState(false)
   const [modelError, setModelError] = useState<string | null>(null)
@@ -149,6 +163,7 @@ export default function App() {
   )
 
   const activeSession = store.activeId ? store.sessions[store.activeId] : null
+  const modelOptions = modelInventory?.options ?? null
 
   // ------------------------------------------------------------- discovery ---
 
@@ -238,12 +253,17 @@ export default function App() {
    * what used to litter the drawer with duplicate copies of the same chat.
    */
   const chatForEvent = useCallback(
-    (eventSessionId: string | null): string | null => {
+    (eventSessionId: string | null, options?: { strict?: boolean }): string | null => {
       if (!eventSessionId) return null
       const mapped = durableKeyFor(eventSessionId)
       if (mapped && (storeRef.current.sessions[mapped] || mapped === activeSessionRef.current)) {
         return mapped
       }
+      // A handle we cannot place is only assumed to be the open chat for TURN
+      // events, where dropping it would lose a reply. Session settings are not
+      // turn-scoped: attributing a stray `session.info` to the open chat is what
+      // silently rewrote its model and reasoning with another chat's values.
+      if (options?.strict) return null
       return activeSessionRef.current ?? mapped
     },
     [durableKeyFor],
@@ -261,9 +281,13 @@ export default function App() {
    * prompt.submit and the event stream use, and it is dead the moment this socket
    * closes, so it must never be the id we remember for next launch.
    */
-  const attachSession = useCallback(async (sessionId: string, options?: { quiet?: boolean }): Promise<boolean> => {
+  const attachSession = useCallback(async (sessionId: string, options?: { quiet?: boolean }): Promise<AttachOutcome> => {
     const client = clientRef.current
-    if (!client) return false
+    if (!client) return 'failed'
+    // Two quick taps (or a resume chain plus a tap) race on one socket: only the
+    // newest attach may move the app, otherwise the older reply lands last and the
+    // open chat, and every model pick aimed at it, belongs to the wrong session.
+    const seq = ++attachSeq.current
     const profile = profileRef.current
     attachErrorRef.current = null
     const params = {
@@ -291,6 +315,8 @@ export default function App() {
       }
     }
 
+    if (seq !== attachSeq.current) return 'superseded'
+
     if (!result) {
       const connection = activeConnectionRef.current
       if (isStaleSession(failure)) {
@@ -310,7 +336,7 @@ export default function App() {
             : `Could not attach: ${attachErrorRef.current}`,
         )
       }
-      return false
+      return 'failed'
     }
 
     // Keep the durable id as the chat's identity and hang the runtime handle off
@@ -330,7 +356,7 @@ export default function App() {
     if (result.inflight?.streaming) {
       setBanner('Attached to a turn already running on the gateway.')
     }
-    return true
+    return 'ok'
   }, [])
 
   /**
@@ -365,7 +391,11 @@ export default function App() {
       for (const target of candidates) {
         if (target === activeSessionRef.current || target === durableIdRef.current) return
         dispatch({ type: 'active', sessionId: target })
-        if (await attachSession(target, { quiet: true })) return
+        const outcome = await attachSession(target, { quiet: true })
+        if (outcome === 'ok') return
+        // Someone else attached while this candidate was being tried: the chain is
+        // stale and must not keep trying (and moving the app) behind their back.
+        if (outcome === 'superseded') return
       }
       if (candidates.length > 0) {
         setBanner(
@@ -471,7 +501,20 @@ export default function App() {
           onEvent: (type, eventSessionId, payload) => {
             // Events arrive addressed to the runtime handle; the store is keyed by
             // the durable id so list rows and the open chat are one session.
-            const sessionId = chatForEvent(eventSessionId)
+            //
+            // `session.info` carries settings, so it is placed strictly: the id it
+            // names must be a chat we know, or its own `stored_session_id` must be.
+            // Otherwise a chat that changed model elsewhere would rewrite this one.
+            let sessionId: string | null
+            if (type === 'session.info') {
+              const stored = String((payload as Record<string, unknown>)?.stored_session_id || '')
+              sessionId =
+                (stored && storeRef.current.sessions[stored] ? stored : null) ||
+                chatForEvent(eventSessionId, { strict: true })
+              if (!sessionId) return
+            } else {
+              sessionId = chatForEvent(eventSessionId)
+            }
             if (type === 'sessions.changed') {
               void refreshDiscovery()
               return
@@ -669,6 +712,7 @@ export default function App() {
 
   const openSession = useCallback(
     async (sessionId: string) => {
+      // Show the chat being opened immediately; if it fails, attachSession says so.
       dispatch({ type: 'active', sessionId })
       setDrawerOpen(false)
       await attachSession(sessionId)
@@ -679,6 +723,8 @@ export default function App() {
   const newChat = useCallback(async () => {
     const client = clientRef.current
     if (!client) return
+    // A new chat outranks an attach that is already in flight.
+    attachSeq.current += 1
     setDrawerOpen(false)
     try {
       const result = await client.request<SessionAttachResult>('session.create', {
@@ -849,52 +895,99 @@ export default function App() {
 
   // ------------------------------------------------------- model & reasoning ---
 
-  /** Read the gateway's model inventory for the current bot / live session. */
-  const loadModels = useCallback(async (refresh = false) => {
-    const client = clientRef.current
-    if (!client) return
-    const key = activeSessionRef.current
-    setModelLoading(true)
-    setModelError(null)
-    try {
-      const options = await loadModelOptions(client, {
-        profile: profileRef.current,
-        // The live handle lets the gateway mark the row this chat really runs on.
-        sessionId: key ? runtimeByKey.current.get(key) || key : null,
-        refresh,
-      })
-      setModelOptions(options)
-    } catch (err) {
-      setModelOptions(null)
-      setModelError(
-        isUnknownMethod(err)
-          ? 'This gateway build has no model.options, so the model list cannot be read.'
-          : `Could not read the model list: ${(err as Error).message}`,
-      )
-    } finally {
-      setModelLoading(false)
-    }
-  }, [])
+  /**
+   * Read the gateway's model inventory for one chat.
+   *
+   * The list is per session and per bot — `model.options` layers the live
+   * session's provider over the catalog — so a load is tagged with the chat it was
+   * asked for, and a slower answer for an older chat is dropped instead of
+   * replacing the rows the sheet is showing.
+   */
+  const loadModels = useCallback(
+    async (target: { key: string | null; profile: string | null }, refresh = false) => {
+      const client = clientRef.current
+      if (!client) return
+      const seq = ++modelSeq.current
+      setModelLoading(true)
+      setModelError(null)
+      try {
+        const options = await loadModelOptions(client, {
+          profile: target.profile,
+          // Only a handle that belongs to THIS chat may be sent. A durable id is not
+          // what model.options resolves, and a stale handle belongs to another chat.
+          sessionId: target.key ? runtimeByKey.current.get(target.key) || null : null,
+          refresh,
+        })
+        if (seq !== modelSeq.current) return
+        setModelInventory({ key: target.key, profile: target.profile, options })
+      } catch (err) {
+        if (seq !== modelSeq.current) return
+        setModelInventory(null)
+        setModelError(
+          isUnknownMethod(err)
+            ? 'This gateway build has no model.options, so the model list cannot be read.'
+            : `Could not read the model list: ${(err as Error).message}`,
+        )
+      } finally {
+        if (seq === modelSeq.current) setModelLoading(false)
+      }
+    },
+    [],
+  )
 
+  /**
+   * Open the picker, bound to the chat that is open right now.
+   *
+   * Binding it matters: the picks then target that chat even if the store's active
+   * id moves, and the inventory is re-read for it rather than reused from whichever
+   * chat happened to open the sheet first.
+   */
   const openModelSheet = useCallback(() => {
-    setModelSheetOpen(true)
-    setModelError(null)
+    const key = activeSessionRef.current
+    const bot = (key ? storeRef.current.sessions[key]?.profile : null) || profileRef.current
+    setModelSheetKey(key)
+    // Scope used to persist between openings: after saving a bot default once, the
+    // next pick wrote the bot again while the open chat kept its model.
+    setModelScope('chat')
+    setModelConfirm(null)
     setModelNotice(null)
-    if (!modelOptions) void loadModels()
-  }, [loadModels, modelOptions])
+    setModelError(null)
+    setModelInventory((prev) => (prev && prev.key === key && prev.profile === bot ? prev : null))
+    setModelSheetOpen(true)
+    void loadModels({ key, profile: bot })
+  }, [loadModels])
+
+  /** Re-probe the providers for the sheet's chat (and the catalog behind it). */
+  const refreshModels = useCallback(() => {
+    const key = modelSheetKey
+    const bot = (key ? storeRef.current.sessions[key]?.profile : null) || profileRef.current
+    void loadModels({ key, profile: bot }, true)
+  }, [loadModels, modelSheetKey])
+
+  // The sheet is bound to one chat: leaving it must close the sheet, or the next
+  // tap would change a conversation the user is no longer looking at.
+  useEffect(() => {
+    if (!modelSheetOpen || !modelSheetKey || !store.activeId) return
+    if (store.activeId === modelSheetKey) return
+    setModelSheetOpen(false)
+    setModelConfirm(null)
+    setModelNotice(null)
+    setModelError(null)
+  }, [store.activeId, modelSheetKey, modelSheetOpen])
 
   /**
    * Switch the model — on the open chat (`/model`) or persisted on the bot.
    *
-   * Chat scope goes through command.dispatch, which is the documented mid-session
-   * switch; bot scope writes the profile's own config, so it takes effect on that
-   * bot's next chat instead of re-pinning the live one.
+   * Chat scope goes through command.dispatch, the documented mid-session switch,
+   * and needs that chat's live handle; bot scope writes the profile's own config,
+   * so it takes effect on that bot's next chat instead of re-pinning the live one.
    */
   const chooseModel = useCallback(
     async (choice: ModelChoice) => {
       const client = clientRef.current
-      const key = activeSessionRef.current
-      const bot = profileRef.current
+      // The chat the sheet was opened for, never "whatever is active now".
+      const key = modelSheetKey
+      const bot = (key ? storeRef.current.sessions[key]?.profile : null) || profileRef.current
       if (!client) return
       setModelBusy(true)
       setModelError(null)
@@ -916,8 +1009,15 @@ export default function App() {
           return
         }
         if (!key) throw new Error('Open a chat first: /model applies to a live session.')
+        const runtime = runtimeByKey.current.get(key)
+        if (!runtime) {
+          // Without its own handle nothing can be pinned on this chat; sending the
+          // durable id instead is what made a pick land somewhere else.
+          throw new Error('That chat is not attached right now. Reopen it, then pick a model.')
+        }
         const result = await applyModel(client, {
-          sessionId: runtimeByKey.current.get(key) || key,
+          sessionId: runtime,
+          storedId: key,
           profile: bot,
           model: choice.model,
         })
@@ -929,13 +1029,14 @@ export default function App() {
         setModelBusy(false)
       }
     },
-    [modelScope, refreshProfiles],
+    [modelScope, modelSheetKey, refreshProfiles],
   )
 
   /** Accept the expensive-model confirmation and write it to the bot. */
   const confirmBotModel = useCallback(async () => {
     const client = clientRef.current
-    const bot = profileRef.current
+    const bot =
+      (modelSheetKey ? storeRef.current.sessions[modelSheetKey]?.profile : null) || profileRef.current
     const pending = modelConfirm
     if (!client || !bot || !pending) return
     setModelBusy(true)
@@ -950,14 +1051,15 @@ export default function App() {
     } finally {
       setModelBusy(false)
     }
-  }, [modelConfirm, refreshProfiles])
+  }, [modelConfirm, modelSheetKey, refreshProfiles])
 
   /** Change reasoning effort — `/reasoning` on the chat, config write on the bot. */
   const chooseReasoning = useCallback(
     async (level: string) => {
       const client = clientRef.current
-      const key = activeSessionRef.current
-      const bot = profileRef.current
+      // Same binding as the model pick: this chat, not the active one.
+      const key = modelSheetKey
+      const bot = (key ? storeRef.current.sessions[key]?.profile : null) || profileRef.current
       if (!client) return
       setModelBusy(true)
       setModelError(null)
@@ -970,8 +1072,13 @@ export default function App() {
           return
         }
         if (!key) throw new Error('Open a chat first: /reasoning applies to a live session.')
+        const runtime = runtimeByKey.current.get(key)
+        if (!runtime) {
+          throw new Error('That chat is not attached right now. Reopen it, then pick a level.')
+        }
         const result = await applyReasoning(client, {
-          sessionId: runtimeByKey.current.get(key) || key,
+          sessionId: runtime,
+          storedId: key,
           profile: bot,
           level,
         })
@@ -984,7 +1091,7 @@ export default function App() {
         setModelBusy(false)
       }
     },
-    [modelScope],
+    [modelScope, modelSheetKey],
   )
 
   const answerPrompt = useCallback((id: string, result: Record<string, unknown>) => {
@@ -1186,7 +1293,9 @@ export default function App() {
 
       <ModelSheet
         open={modelSheetOpen}
-        profile={profile}
+        // The BOT a pick writes to is the one owning the chat the sheet was opened
+        // for — not whatever bot is selected in the drawer now.
+        profile={(modelSheetKey ? store.sessions[modelSheetKey]?.profile : null) ?? profile}
         model={activeSession?.model || ''}
         provider={String((activeSession?.info?.provider as string) || '')}
         reasoning={activeSession?.reasoning || ''}
@@ -1205,7 +1314,7 @@ export default function App() {
         confirm={modelConfirm}
         onConfirm={() => void confirmBotModel()}
         onCancelConfirm={() => setModelConfirm(null)}
-        onRefresh={() => void loadModels(true)}
+        onRefresh={refreshModels}
         onPickModel={(choice) => void chooseModel(choice)}
         onPickReasoning={(level) => void chooseReasoning(level)}
         onClose={() => setModelSheetOpen(false)}

@@ -3,14 +3,37 @@
 The build lives in the GitHub release, not in the repo (a debug APK is 12 MB of
 rebuildable binary and would sit in git history forever).
 
-**Download:** https://github.com/joaoalbuq/Hermes-Androidapp/releases/download/v1.4/hermes-mobile-1.4-debug.apk
+**Download:** https://github.com/joaoalbuq/Hermes-Androidapp/releases/download/v1.4.1/hermes-mobile-1.4.1-debug.apk
 
-- applicationId `com.hermesmobile.viewer`, versionCode 5, versionName 1.4
+- applicationId `com.hermesmobile.viewer`, versionCode 6, versionName 1.4.1
 - minSdk 26 (Android 8+), targetSdk 36
-- 12,396,015 bytes
-- sha256 `348746f94b5da48c3611e94e9f66486f3f1955ca090ecb1150ce62b1546cdf47`
+- 12,396,451 bytes
+- sha256 `c571df86339f2d1fe067e5b0c72071a4d19786651a7d1b38222492530cf02694`
 - Debug-signed with this machine's Android debug key (same cert as 1.0–1.2, so it
   installs in place), personal use, not for distribution.
+
+## 1.4.1 — the picker stays on the chat you opened it from
+
+Four separate leaks made a model or reasoning pick land somewhere else, and all of them are fixed:
+
+- **The inventory was read once and reused.** `model.options` is per session and per bot, so the
+  rows (and the "current" one) could belong to a previous chat. It is now re-read for the chat the
+  sheet was opened for, tagged with that chat, and a slower answer for an older chat is dropped.
+- **The sheet is bound to one chat.** Picks target the chat it was opened for even if the active id
+  moves, and switching chats closes the sheet instead of leaving it over another conversation.
+- **The scope reset.** After saving a bot default once, the scope stayed on "Bot" for the next
+  opening, so later taps wrote the profile while the open chat kept its model. It now opens on
+  "This chat" every time.
+- **A failed command fell through to `config.set`.** Any RPC error (unknown model, busy session)
+  became a config write, which resolved the target differently and could change the bot's default
+  while the chat stayed put. Only a gateway *without* `command.dispatch` falls back now, and that
+  fallback addresses the session by its durable id rather than the runtime handle.
+
+Also: a stray `session.info` addressed to a chat this client never attached (another client changing
+something) no longer rewrites the open chat's model and reasoning, a reply that reports its own
+failure as text is surfaced instead of shown as success, an un-attached chat refuses a pick with a
+clear message instead of addressing the durable id, and two quick chat switches can no longer settle
+out of order.
 
 ## 1.4 — model & reasoning, and notifications in the background
 

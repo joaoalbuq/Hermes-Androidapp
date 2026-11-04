@@ -131,7 +131,10 @@ export default function ModelSheet({
                 {group.slug === provider ? <span className="badge">current</span> : null}
               </div>
               {group.choices.map((choice) => {
-                const active = choice.model === model
+                // One model id can be offered by several providers; only the row this
+                // chat really runs should carry the dot, or two rows look current and
+                // tapping the wrong one switches provider behind the same name.
+                const active = choice.model === model && (!provider || choice.provider === provider)
                 return (
                   <button
                     key={`${choice.provider}:${choice.model}`}

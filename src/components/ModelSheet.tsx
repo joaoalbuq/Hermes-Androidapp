@@ -25,6 +25,18 @@ interface Props {
   onClose: () => void
 }
 
+/**
+ * Do two model ids name the same model?
+ *
+ * The gateway hands out bare ids ("claude-sonnet-4.6") in the inventory, but a
+ * session can report the qualified form ("anthropic/claude-sonnet-4.6"). Without
+ * this, the row the chat is actually pinned to never carries the dot.
+ */
+export function sameModel(a: string, b: string): boolean {
+  if (!a || !b) return false
+  return a === b || a.endsWith(`/${b}`) || b.endsWith(`/${a}`)
+}
+
 /** Short label for a model id like "anthropic/claude-sonnet-4.6" or "gpt-5.5". */
 export function shortModel(model: string): string {
   if (!model) return 'model'
@@ -134,7 +146,7 @@ export default function ModelSheet({
                 // One model id can be offered by several providers; only the row this
                 // chat really runs should carry the dot, or two rows look current and
                 // tapping the wrong one switches provider behind the same name.
-                const active = choice.model === model && (!provider || choice.provider === provider)
+                const active = sameModel(choice.model, model) && (!provider || choice.provider === provider)
                 return (
                   <button
                     key={`${choice.provider}:${choice.model}`}

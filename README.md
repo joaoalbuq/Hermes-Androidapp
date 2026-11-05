@@ -14,7 +14,7 @@ nothing server-side. The only setup is a gateway URL and a token.
 
 A built debug APK is attached to the GitHub release:
 
-<https://github.com/joaoalbuq/Hermes-Androidapp/releases/download/v1.4.1/hermes-mobile-1.4.1-debug.apk>
+<https://github.com/joaoalbuq/Hermes-Androidapp/releases/download/v1.4.2/hermes-mobile-1.4.2-debug.apk>
 
 Repo: <https://github.com/joaoalbuq/Hermes-Androidapp>
 

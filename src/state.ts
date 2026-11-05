@@ -23,6 +23,21 @@ export type ChatItem =
     }
   | { kind: 'system'; id: string; text: string; tone: 'info' | 'error' }
 
+/**
+ * What the user chose for one chat, owned by the app rather than the gateway.
+ *
+ * The gateway reports a model through `session.info` and through every
+ * `session.active_list` row, and both can lag or describe the bot's default
+ * instead of the pinned chat. Keeping the pick here means the chat keeps showing
+ * (and running) what was chosen until it is changed again — no matter what the
+ * live feed says in between.
+ */
+export interface SessionPin {
+  model?: string
+  provider?: string
+  reasoning?: string
+}
+
 export interface SessionState {
   /** Durable/stored id — the stable identity a list row also carries. */
   id: string
@@ -39,9 +54,13 @@ export interface SessionState {
   /** "working" | "waiting" | "starting" | "idle" */
   status: string
   model: string
+  /** Provider that model came from, when one is known. */
+  provider: string
   /** Live reasoning effort (`reasoning_effort`) and what this route really sends. */
   reasoning: string
   reasoningWire: string
+  /** The pick this chat sticks to. Set by the picker, never by the gateway. */
+  pin: SessionPin | null
   profile: string | null
   attached: boolean
   items: ChatItem[]
@@ -140,8 +159,10 @@ function emptySession(id: string, patch: Partial<SessionState> = {}): SessionSta
     running: false,
     status: 'idle',
     model: '',
+    provider: '',
     reasoning: '',
     reasoningWire: '',
+    pin: null,
     profile: null,
     attached: false,
     items: [],
@@ -217,9 +238,13 @@ export type Action =
       type: 'turnSettings'
       sessionId: string
       model?: string
+      provider?: string
       reasoning?: string
       reasoningWire?: string
+      /** Remember this as the chat's pick, so nothing else can overwrite it. */
+      pinned?: boolean
     }
+  | { type: 'pin'; sessionId: string; pin: SessionPin | null }
   | { type: 'event'; sessionId: string | null; eventType: string; payload: Record<string, unknown> }
   | { type: 'reset' }
 
@@ -240,12 +265,16 @@ export function reducer(store: Store, action: Action): Store {
         if (!order.includes(id)) order.push(id)
       }
       for (const row of action.live) {
+        const existing = sessions[row.id]
+        // A refresh is not a model change: the live feed reports whatever the
+        // gateway thinks this chat runs, which can be the bot's default. Taking it
+        // here is what made a pick revert on the next drawer refresh.
         merge(row.id, {
-          title: row.title || sessions[row.id]?.title || '',
-          preview: row.preview || sessions[row.id]?.preview || '',
+          title: row.title || existing?.title || '',
+          preview: row.preview || existing?.preview || '',
           running: row.status === 'working' || row.status === 'starting',
           status: row.status,
-          model: row.model || '',
+          model: existing?.pin?.model || row.model || existing?.model || '',
           messageCount: row.message_count,
           lastActive: row.last_active * 1000,
         })
@@ -295,14 +324,19 @@ export function reducer(store: Store, action: Action): Store {
         streamText = rebuilt.streamText
       }
       const info = result.info || null
+      const previous = store.sessions[sessionId]
+      // A resume reports the session as stored on the gateway; the user's pick wins
+      // over it, and App re-applies the pin to the live session after attaching.
+      const pin = previous?.pin ?? null
       return withSession(store, sessionId, {
         runtimeId: action.runtimeId ?? result.session_id ?? store.sessions[sessionId]?.runtimeId ?? null,
         title: info?.title || store.sessions[sessionId]?.title || '',
-        model: info?.model || store.sessions[sessionId]?.model || '',
-        reasoning:
-          info?.reasoning_effort || store.sessions[sessionId]?.reasoning || '',
+        model: pin?.model || info?.model || previous?.model || '',
+        provider:
+          pin?.provider || String(info?.provider || '') || previous?.provider || '',
+        reasoning: pin?.reasoning || info?.reasoning_effort || previous?.reasoning || '',
         reasoningWire:
-          info?.reasoning_effort_wire || store.sessions[sessionId]?.reasoningWire || '',
+          info?.reasoning_effort_wire || previous?.reasoningWire || '',
         profile: action.profile ?? store.sessions[sessionId]?.profile ?? null,
         items,
         streamText,
@@ -375,14 +409,37 @@ export function reducer(store: Store, action: Action): Store {
     }
 
     case 'turnSettings': {
-      // Applied optimistically right after the change is accepted: the gateway's
-      // own session.info event lands a moment later and corrects the wire level.
+      // Applied as soon as the change is accepted. When it came from the picker the
+      // choice is pinned too, so the next session.info or drawer refresh cannot put
+      // the chat back on the model it was running before.
       const session = store.sessions[action.sessionId]
       if (!session) return store
+      const pin: SessionPin | null = action.pinned
+        ? {
+            ...(session.pin || {}),
+            ...(action.model ? { model: action.model } : {}),
+            ...(action.provider ? { provider: action.provider } : {}),
+            ...(action.reasoning ? { reasoning: action.reasoning } : {}),
+          }
+        : session.pin
       return withSession(store, action.sessionId, {
         model: action.model ?? session.model,
+        provider: action.provider ?? session.provider,
         reasoning: action.reasoning ?? session.reasoning,
         reasoningWire: action.reasoningWire ?? session.reasoningWire,
+        pin,
+      })
+    }
+
+    case 'pin': {
+      const session = store.sessions[action.sessionId] ?? emptySession(action.sessionId)
+      const pin = action.pin
+      if (!pin) return withSession(store, action.sessionId, { pin: null })
+      return withSession(store, action.sessionId, {
+        pin,
+        model: pin.model || session.model,
+        provider: pin.provider || session.provider,
+        reasoning: pin.reasoning || session.reasoning,
       })
     }
 
@@ -489,9 +546,12 @@ export function reducer(store: Store, action: Action): Store {
           const info = payload as unknown as SessionLiveInfo
           return withSession(store, sessionId, {
             info,
-            model: info.model || session.model,
-            // A model switch or `/reasoning` lands here as a session.info event.
-            reasoning: info.reasoning_effort ?? session.reasoning,
+            // A pinned chat keeps its pick: this event also fires for reasons that
+            // have nothing to do with the model (a resume, another client, a turn
+            // starting) and reports the session's default each time.
+            model: session.pin?.model || info.model || session.model,
+            provider: session.pin?.provider || String(info.provider || '') || session.provider,
+            reasoning: session.pin?.reasoning ?? info.reasoning_effort ?? session.reasoning,
             reasoningWire: info.reasoning_effort_wire ?? session.reasoningWire,
             title: info.title || session.title,
             running: !!info.running,

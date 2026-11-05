@@ -47,6 +47,10 @@ const lastSessionKey = (id: string, profile: string | null) =>
 /** Which bot was selected, so a relaunch comes back to the same one. */
 const profileKey = (id: string) => `hermes.profile.${id}`
 
+/** The model/reasoning this chat sticks to, per connection + durable chat id. */
+const pinKey = (id: string, sessionId: string) =>
+  `hermes.pin.${id}.${encodeURIComponent(sessionId)}`
+
 let insecureFallback = false
 
 export function insecureTokenFallback(): boolean {
@@ -256,14 +260,47 @@ export async function saveProfile(id: string, profile: string | null): Promise<v
   else await Preferences.remove({ key })
 }
 
-export async function saveLastSession(
-  id: string,
+export async function saveLastSession(  id: string,
   profile: string | null,
   sessionId: string | null,
 ): Promise<void> {
   const key = lastSessionKey(id, profile)
   if (sessionId) await Preferences.set({ key, value: sessionId })
   else await Preferences.remove({ key })
+}
+
+/**
+ * The model/reasoning a chat sticks to.
+ *
+ * Kept on the phone, not on the gateway: it must survive a relaunch even when the
+ * gateway keeps reporting the session's default, and it is only ever replaced by
+ * another pick from the picker.
+ */
+export async function loadPin(
+  id: string,
+  sessionId: string,
+): Promise<{ model?: string; provider?: string; reasoning?: string } | null> {
+  const { value } = await Preferences.get({ key: pinKey(id, sessionId) })
+  if (!value) return null
+  try {
+    const parsed = JSON.parse(value) as { model?: string; provider?: string; reasoning?: string }
+    return parsed && typeof parsed === 'object' ? parsed : null
+  } catch {
+    return null
+  }
+}
+
+export async function savePin(
+  id: string,
+  sessionId: string,
+  pin: { model?: string; provider?: string; reasoning?: string } | null,
+): Promise<void> {
+  const key = pinKey(id, sessionId)
+  if (pin && (pin.model || pin.reasoning)) {
+    await Preferences.set({ key, value: JSON.stringify(pin) })
+  } else {
+    await Preferences.remove({ key })
+  }
 }
 
 export async function deleteConnection(id: string): Promise<void> {

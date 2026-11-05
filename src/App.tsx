@@ -353,6 +353,39 @@ export default function App() {
       // Persist the durable id, never the runtime handle.
       void storage.saveLastSession(connection.id, profile, durableId)
     }
+    // Restore the chat's own pick.
+    //
+    // The gateway describes a resumed session the way it is stored — often the
+    // bot's default — so a model chosen earlier on this phone has to be put back
+    // on the live agent, or the chat silently runs something else again.
+    if (connection && seq === attachSeq.current) {
+      const pin = await storage.loadPin(connection.id, durableId)
+      if (pin && (pin.model || pin.reasoning)) {
+        dispatch({ type: 'pin', sessionId: durableId, pin })
+        const liveModel = String(result.info?.model || '')
+        const liveReasoning = String(result.info?.reasoning_effort || '')
+        if (pin.model && pin.model !== liveModel && seq === attachSeq.current) {
+          void applyModel(client, {
+            sessionId: runtimeId,
+            storedId: durableId,
+            profile,
+            model: pin.model,
+          }).catch((err: Error) =>
+            setBanner(`This chat is pinned to ${pin.model}, but the gateway refused it: ${err.message}`),
+          )
+        }
+        if (pin.reasoning && pin.reasoning !== liveReasoning && seq === attachSeq.current) {
+          void applyReasoning(client, {
+            sessionId: runtimeId,
+            storedId: durableId,
+            profile,
+            level: pin.reasoning,
+          }).catch((err: Error) =>
+            setBanner(`${pin.reasoning} reasoning could not be restored: ${err.message}`),
+          )
+        }
+      }
+    }
     if (result.inflight?.streaming) {
       setBanner('Attached to a turn already running on the gateway.')
     }
@@ -1021,7 +1054,24 @@ export default function App() {
           profile: bot,
           model: choice.model,
         })
-        dispatch({ type: 'turnSettings', sessionId: key, model: choice.model })
+        // Pin the pick to this chat: it is what the pill and the sheet show from
+        // now on, and what a later resume re-applies. The provider comes along
+        // because one model id can be offered by several of them.
+        dispatch({
+          type: 'turnSettings',
+          sessionId: key,
+          model: choice.model,
+          provider: choice.provider,
+          pinned: true,
+        })
+        const connection = activeConnectionRef.current
+        if (connection) {
+          void storage.savePin(connection.id, key, {
+            ...(storeRef.current.sessions[key]?.pin || {}),
+            model: choice.model,
+            provider: choice.provider,
+          })
+        }
         setModelNotice(result.message)
       } catch (err) {
         setModelError((err as Error).message)
@@ -1082,8 +1132,22 @@ export default function App() {
           profile: bot,
           level,
         })
-        // The wire level is only known once the gateway reports it back.
-        dispatch({ type: 'turnSettings', sessionId: key, reasoning: level, reasoningWire: '' })
+        // The wire level is only known once the gateway reports it back, but the
+        // level the user asked for is pinned so a later session.info cannot undo it.
+        dispatch({
+          type: 'turnSettings',
+          sessionId: key,
+          reasoning: level,
+          reasoningWire: '',
+          pinned: true,
+        })
+        const connection = activeConnectionRef.current
+        if (connection) {
+          void storage.savePin(connection.id, key, {
+            ...(storeRef.current.sessions[key]?.pin || {}),
+            reasoning: level,
+          })
+        }
         setModelNotice(result.message)
       } catch (err) {
         setModelError((err as Error).message)
@@ -1275,7 +1339,9 @@ export default function App() {
           setDrawerOpen(false)
           setSettingsOpen(true)
         }}
-        onRefresh={refreshDiscovery}
+        // Wrapped: a bare handler would receive the click event as the profile
+        // argument, and the resulting request cannot be serialised.
+        onRefresh={() => void refreshDiscovery()}
         connectionName={activeConnection.name}
         baseUrl={activeConnection.baseUrl}
         authMode={activeConnection.authMode}
@@ -1297,7 +1363,7 @@ export default function App() {
         // for — not whatever bot is selected in the drawer now.
         profile={(modelSheetKey ? store.sessions[modelSheetKey]?.profile : null) ?? profile}
         model={activeSession?.model || ''}
-        provider={String((activeSession?.info?.provider as string) || '')}
+        provider={activeSession?.provider || ''}
         reasoning={activeSession?.reasoning || ''}
         reasoningWire={activeSession?.reasoningWire || ''}
         options={modelOptions}

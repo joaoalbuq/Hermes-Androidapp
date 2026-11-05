@@ -3,14 +3,35 @@
 The build lives in the GitHub release, not in the repo (a debug APK is 12 MB of
 rebuildable binary and would sit in git history forever).
 
-**Download:** https://github.com/joaoalbuq/Hermes-Androidapp/releases/download/v1.4.1/hermes-mobile-1.4.1-debug.apk
+**Download:** https://github.com/joaoalbuq/Hermes-Androidapp/releases/download/v1.4.2/hermes-mobile-1.4.2-debug.apk
 
-- applicationId `com.hermesmobile.viewer`, versionCode 6, versionName 1.4.1
+- applicationId `com.hermesmobile.viewer`, versionCode 7, versionName 1.4.2
 - minSdk 26 (Android 8+), targetSdk 36
-- 12,396,451 bytes
-- sha256 `c571df86339f2d1fe067e5b0c72071a4d19786651a7d1b38222492530cf02694`
+- 12,397,059 bytes
+- sha256 `5f7b390082e2dbcda95110f35eb415d776b91550e3cb58ca7c6c01c554a34782`
 - Debug-signed with this machine's Android debug key (same cert as 1.0–1.2, so it
   installs in place), personal use, not for distribution.
+
+## 1.4.2 — the pick now belongs to the chat, on the phone
+
+1.4.1 stopped picks from being aimed at the wrong chat, but the chat still never owned the choice:
+everything the app displayed came from whatever the gateway last said, and it says a lot.
+
+- **A drawer refresh reset the model.** `session.active_list` rows carry a model, and the discovery
+  merge took it every time — so the pill quietly went back to the bot's default (or blank) seconds
+  after a pick. A refresh is no longer treated as a model change.
+- **`session.info` reset it too.** That event also fires for resumes, turn starts and other clients,
+  and reports the session's stored default each time. A chat with a pick now ignores the model and
+  reasoning in it.
+- **The pick is stored on the phone and re-applied.** It is saved per chat, survives relaunch, and
+  when a reopened chat is running something else the app puts the choice back on the live session by
+  itself (verified against a gateway that reports the default after every restart).
+- **The provider stuck to the old one.** Picking a model from another provider left the sheet headed
+  with the old provider and marked no row as current, which read as "nothing happened". The provider
+  is now part of the pick, and ids match with or without a provider prefix.
+
+Also: the drawer's Refresh button passed its own click event as the profile and failed with
+"Could not list sessions" — it refreshes properly now.
 
 ## 1.4.1 — the picker stays on the chat you opened it from
 
